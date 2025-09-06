@@ -11,8 +11,8 @@ let sessionId = null;
 let lastUserMessage = '';
 let streamingController = null;
 const screenshotEl = document.getElementById('page-screenshot');
-const pageHtmlEl = document.getElementById('page-html');
-const pageIframe = document.getElementById('page-iframe');
+let livePreviewTimer = null;
+let lastStreamAt = 0;
 
 function addUserMessage(text) {
   const m = document.createElement('div');
@@ -243,24 +243,11 @@ async function sendMessage(message, clickedUrl = null) {
             try {
               if (data.b64) {
                 screenshotEl.src = `data:image/png;base64,${data.b64}`;
+                lastStreamAt = Date.now();
               }
             } catch (e) {}
             break;
-          case 'page_html':
-            try {
-              if (data.html && pageHtmlEl) {
-                pageHtmlEl.innerHTML = sanitizeHTML(data.html);
-              }
-            } catch (e) {}
-            break;
-          case 'page_cached':
-            try {
-              if (data.url && pageIframe) {
-                // bust cache
-                pageIframe.src = data.url + '?t=' + Date.now();
-              }
-            } catch (e) {}
-            break;
+          // page_html and page_cached disabled
           case 'llm_meta':
             if (data.phase === 'plan') {
               addTimeline(timeline, `Planning model: ${data.model || ''} (${data.base_url || ''})`);
@@ -372,10 +359,12 @@ async function refreshBrowserStatus() {
       browserStatusEl.textContent = 'Browser: running';
       browserStatusEl.style.background = '#16301f';
       browserStatusEl.style.borderColor = '#335f45';
+      startLivePreview();
     } else {
       browserStatusEl.textContent = 'Browser: stopped';
       browserStatusEl.style.background = '#2a1c1c';
       browserStatusEl.style.borderColor = '#5e2c2c';
+      stopLivePreview();
     }
   } catch (e) {
     browserStatusEl.textContent = 'Browser: unknown';
@@ -390,6 +379,28 @@ async function startBrowser() {
 async function stopBrowser() {
   await fetch('/api/browser/stop', { method: 'POST' });
   await refreshBrowserStatus();
+}
+
+function startLivePreview() {
+  if (livePreviewTimer) return;
+  livePreviewTimer = setInterval(async () => {
+    // If recently updated by streaming, skip this poll
+    if (Date.now() - lastStreamAt < 500) return;
+    try {
+      const r = await fetch('/api/browser/capture');
+      const j = await r.json();
+      if (j && j.ok && j.b64) {
+        screenshotEl.src = `data:image/png;base64,${j.b64}`;
+      }
+    } catch (e) { /* ignore */ }
+  }, 1500);
+}
+
+function stopLivePreview() {
+  if (livePreviewTimer) {
+    clearInterval(livePreviewTimer);
+    livePreviewTimer = null;
+  }
 }
 
 startBtn?.addEventListener('click', startBrowser);

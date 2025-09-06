@@ -72,7 +72,10 @@ def load_config() -> Dict:
         "answer_temperature": float(os.getenv("ANSWER_TEMPERATURE", "0.2")),
         "answer_top_p": float(os.getenv("ANSWER_TOP_P", "1.0")),
         "answer_max_tokens": int(os.getenv("ANSWER_MAX_TOKENS", "1200")),
-        # (rrweb removed)
+        # Preview/replay
+        "preview_enable_pan": _env_bool("PREVIEW_ENABLE_PAN", True),
+        "preview_frames": int(os.getenv("PREVIEW_FRAMES", "24")),
+        "preview_delay": float(os.getenv("PREVIEW_DELAY", "0.15")),
     }
     # Overlay with config file if present
     try:
@@ -427,6 +430,35 @@ class Browser:
                 yield b64
             time.sleep(max(0.0, delay))
 
+    def pan_screenshots(self, frames: int = 20, delay: float = 0.15) -> Generator[str, None, None]:
+        """Programmatically scroll down the page while taking screenshots to create a replay-like feel."""
+        try:
+            total = int(self.driver.execute_script(
+                "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, document.body.offsetHeight, document.documentElement.offsetHeight, document.documentElement.clientHeight);"
+            ) or 0)
+            vh = int(self.driver.execute_script("return window.innerHeight;") or 0)
+            max_y = max(0, total - vh)
+            steps = max(1, int(frames))
+            for i in range(steps):
+                # Ease-in-out could be nicer; linear is fine
+                y = int(max_y * (i / max(1, steps - 1)))
+                try:
+                    self.driver.execute_script("window.scrollTo(0, arguments[0]);", y)
+                except Exception:
+                    pass
+                time.sleep(max(0.0, delay))
+                b64 = self.screenshot_b64()
+                if b64:
+                    yield b64
+        except Exception:
+            # Fallback to static frames if scrolling fails
+            yield from self.stream_screenshots(frames=frames, delay=delay)
+        finally:
+            try:
+                self.driver.execute_script("window.scrollTo(0, 0);")
+            except Exception:
+                pass
+
     def quit(self):
         try:
             self.driver.quit()
@@ -729,6 +761,18 @@ def browser_stop():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.get("/api/browser/capture")
+def browser_capture():
+    try:
+        conf = CONFIG
+        br = BROWSER_MANAGER.get_or_start(conf)
+        b64 = br.screenshot_b64()
+        if not b64:
+            return jsonify({"ok": False, "error": "no_screenshot"}), 500
+        return jsonify({"ok": True, "b64": b64})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.post("/api/message")
 def api_message():
@@ -814,12 +858,14 @@ def api_message():
                 yield sse("search_results", {"query": q, "results": results})
                 # Fallback previews: HTML and screenshots
                 try:
-                    snap_html = browser.html_snapshot()
-                    if snap_html:
-                        cid = cache_html_snapshot(snap_html, getattr(browser.driver, 'current_url', ''), browser.driver.title)
-                        yield sse("page_cached", {"url": f"/cache/{cid}", "cache_id": cid, "title": browser.driver.title})
-                    for frame in browser.stream_screenshots(frames=3, delay=0.4):
-                        yield sse("screenshot", {"b64": frame})
+                    frames = max(3, int(conf.get("preview_frames", 24)))
+                    delay = max(0.05, float(conf.get("preview_delay", 0.15)))
+                    if conf.get("preview_enable_pan", True):
+                        for frame in browser.pan_screenshots(frames=frames, delay=delay):
+                            yield sse("screenshot", {"b64": frame})
+                    else:
+                        for frame in browser.stream_screenshots(frames=frames, delay=delay):
+                            yield sse("screenshot", {"b64": frame})
                 except Exception:
                     pass
                 collected_results.extend(results)
@@ -834,12 +880,14 @@ def api_message():
                     yield sse("read_page", {"url": page["url"], "title": page["title"]})
                     # Fallback: HTML + screenshots
                     try:
-                        snap_html = browser.html_snapshot()
-                        if snap_html:
-                            cid = cache_html_snapshot(snap_html, page["url"], page["title"])
-                            yield sse("page_cached", {"url": f"/cache/{cid}", "cache_id": cid, "title": page["title"]})
-                        for frame in browser.stream_screenshots(frames=5, delay=0.35):
-                            yield sse("screenshot", {"b64": frame})
+                        frames = max(5, int(conf.get("preview_frames", 24)))
+                        delay = max(0.05, float(conf.get("preview_delay", 0.15)))
+                        if conf.get("preview_enable_pan", True):
+                            for frame in browser.pan_screenshots(frames=frames, delay=delay):
+                                yield sse("screenshot", {"b64": frame})
+                        else:
+                            for frame in browser.stream_screenshots(frames=frames, delay=delay):
+                                yield sse("screenshot", {"b64": frame})
                     except Exception:
                         pass
                     pages_to_read.append(page)
@@ -859,12 +907,14 @@ def api_message():
                         yield sse("read_page", {"url": page["url"], "title": page["title"]})
                         # Fallback: HTML + screenshots
                         try:
-                            snap_html = browser.html_snapshot()
-                            if snap_html:
-                                cid = cache_html_snapshot(snap_html, page["url"], page["title"])
-                                yield sse("page_cached", {"url": f"/cache/{cid}", "cache_id": cid, "title": page["title"]})
-                            for frame in browser.stream_screenshots(frames=5, delay=0.35):
-                                yield sse("screenshot", {"b64": frame})
+                            frames = max(5, int(conf.get("preview_frames", 24)))
+                            delay = max(0.05, float(conf.get("preview_delay", 0.15)))
+                            if conf.get("preview_enable_pan", True):
+                                for frame in browser.pan_screenshots(frames=frames, delay=delay):
+                                    yield sse("screenshot", {"b64": frame})
+                            else:
+                                for frame in browser.stream_screenshots(frames=frames, delay=delay):
+                                    yield sse("screenshot", {"b64": frame})
                         except Exception:
                             pass
                         pages_to_read.append(page)

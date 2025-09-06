@@ -22,22 +22,21 @@
 
       <main class="layout">
         <section class="left">
-          <div id="chat" class="chat"></div>
-          <form id="chat-form" class="chat-form">
-            <input id="chat-input" type="text" placeholder="Ask a question..." autocomplete="off" />
-            <button type="submit">Send</button>
-          </form>
+          <div class="panel tall">
+            <div class="label">Chat</div>
+            <div id="chat" class="chat"></div>
+            <form id="chat-form" class="chat-form">
+              <input id="chat-input" type="text" placeholder="Ask a question..." autocomplete="off" />
+              <button type="submit">Send</button>
+            </form>
+          </div>
         </section>
         <aside class="right">
-          <div class="panel">
-            <div class="label">Live Browser Preview</div>
-            <div id="screenshot-wrap" class="screenshot-wrap">
+          <div class="panel tall">
+            <div class="label">Live Browser Monitor</div>
+            <div id="screenshot-wrap" class="screenshot-wrap big">
               <img id="page-screenshot" alt="screenshot" />
             </div>
-            <div class="label" style="margin-top:8px;">HTML Snapshot</div>
-            <div id="page-html" class="page-html"></div>
-            <div class="label" style="margin-top:8px;">Cached Page (iframe)</div>
-            <iframe id="page-iframe" class="page-iframe" sandbox></iframe>
           </div>
         </aside>
       </main>
