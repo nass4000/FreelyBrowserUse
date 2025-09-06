@@ -1,0 +1,4 @@
+Flask>=3.0.0
+requests>=2.31.0
+selenium>=4.21.0
+undetected-chromedriver>=3.5.5

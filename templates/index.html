@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Deep Research Assistant</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>Deep Research Assistant</h1>
+        <p class="subtitle">Plan → Act → Summarize with citations</p>
+      </header>
+
+      <main>
+        <div id="chat" class="chat"></div>
+
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" type="text" placeholder="Ask a question..." autocomplete="off" />
+          <button type="submit">Send</button>
+        </form>
+      </main>
+
+      <footer>
+        <small>
+          Uses Flask, undetected-chromedriver (Selenium), and OpenRouter LLMs. Keep the app running while browsing.
+        </small>
+      </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+  </html>
+

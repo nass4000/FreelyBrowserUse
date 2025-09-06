@@ -1,0 +1,48 @@
+:root {
+  --bg: #0b0f14;
+  --panel: #121821;
+  --text: #e6eef8;
+  --muted: #9bb1c9;
+  --accent: #4aa3ff;
+  --success: #4ccd7a;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  color: var(--text);
+  background: linear-gradient(180deg, #0b0f14, #0e131a 40%, #0b0f14);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif;
+}
+
+.app { max-width: 900px; margin: 0 auto; padding: 18px; }
+
+header { margin-bottom: 12px; }
+h1 { margin: 0 0 6px; font-size: 22px; }
+.subtitle { margin: 0; color: var(--muted); font-size: 13px; }
+
+main { background: var(--panel); border-radius: 12px; padding: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
+.chat { height: 60vh; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
+
+.msg { padding: 10px 12px; border-radius: 10px; white-space: pre-wrap; line-height: 1.45; }
+.msg.user { align-self: flex-end; background: #263445; }
+.msg.assistant { align-self: stretch; background: #0e141c; border: 1px solid #1b2735; }
+.assistant-actions { color: var(--muted); font-size: 13px; display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.assistant-content { font-size: 15px; color: var(--text); }
+.status { color: var(--muted); font-style: italic; }
+.label { color: var(--accent); font-weight: 600; margin-bottom: 4px; }
+
+.results-block, .plan-block { background: #0b1119; border: 1px solid #182433; border-radius: 8px; padding: 8px; }
+.results-list { display: flex; flex-direction: column; gap: 6px; }
+.result-item a { color: var(--success); text-decoration: none; }
+.result-item a:hover { text-decoration: underline; }
+.snippet { color: var(--muted); font-size: 12px; }
+
+.chat-form { display: flex; gap: 8px; margin-top: 10px; }
+.chat-form input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #223045; background: #0e141c; color: var(--text); }
+.chat-form button { padding: 10px 14px; border-radius: 8px; border: 1px solid #2a3b54; background: #19314c; color: var(--text); cursor: pointer; }
+.chat-form button:hover { background: #234764; }
+
+footer { margin-top: 12px; color: var(--muted); }
+
