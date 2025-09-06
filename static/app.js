@@ -10,7 +10,6 @@ const browserStatusEl = document.getElementById('browser-status');
 let sessionId = null;
 let lastUserMessage = '';
 let streamingController = null;
-let rrwebReplayer = null;
 const screenshotEl = document.getElementById('page-screenshot');
 const pageHtmlEl = document.getElementById('page-html');
 const pageIframe = document.getElementById('page-iframe');
@@ -239,19 +238,6 @@ async function sendMessage(message, clickedUrl = null) {
             htmlBuffer += data.text || '';
             content.innerHTML = sanitizeHTML(htmlBuffer);
             chatEl.scrollTop = chatEl.scrollHeight;
-            break;
-          case 'rrweb':
-            try {
-              const evs = data.events || [];
-              if (!rrwebReplayer && window.rrweb) {
-                const container = document.getElementById('rrweb-player');
-                rrwebReplayer = new rrweb.Replayer([], { root: container, liveMode: true });
-                rrwebReplayer.play();
-              }
-              if (rrwebReplayer) {
-                evs.forEach(e => rrwebReplayer.addEvent(e));
-              }
-            } catch (e) {}
             break;
           case 'screenshot':
             try {

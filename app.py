@@ -72,9 +72,7 @@ def load_config() -> Dict:
         "answer_temperature": float(os.getenv("ANSWER_TEMPERATURE", "0.2")),
         "answer_top_p": float(os.getenv("ANSWER_TOP_P", "1.0")),
         "answer_max_tokens": int(os.getenv("ANSWER_MAX_TOKENS", "1200")),
-        # rrweb extension
-        "rrweb_use_extension": _env_bool("RRWEB_USE_EXTENSION", False),
-        "rrweb_extension_path": os.getenv("RRWEB_EXTENSION_PATH", os.path.join(os.getcwd(), "extensions", "rrweb")),
+        # (rrweb removed)
     }
     # Overlay with config file if present
     try:
@@ -320,11 +318,11 @@ class OpenRouterClient:
 # Headless Browser Wrapper (undetected_chromedriver + Selenium)
 # -----------------------------
 class Browser:
-    def __init__(self, headless: bool = True, pageload_timeout: int = 25, driver_path: Optional[str] = None, binary_path: Optional[str] = None, extension_paths: Optional[List[str]] = None):
-        self.driver = self._init_driver(headless, driver_path=driver_path, binary_path=binary_path, extension_paths=extension_paths)
+    def __init__(self, headless: bool = True, pageload_timeout: int = 25, driver_path: Optional[str] = None, binary_path: Optional[str] = None):
+        self.driver = self._init_driver(headless, driver_path=driver_path, binary_path=binary_path)
         self.driver.set_page_load_timeout(pageload_timeout)
 
-    def _build_options(self, headless: bool, binary_path: Optional[str] = None, extension_paths: Optional[List[str]] = None):
+    def _build_options(self, headless: bool, binary_path: Optional[str] = None):
         options = uc.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
@@ -333,23 +331,15 @@ class Browser:
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1280,800")
-        if not extension_paths:
-            options.add_argument("--incognito")
+        options.add_argument("--incognito")
         if binary_path:
             try:
                 options.binary_location = binary_path
             except Exception:
                 pass
-        if extension_paths:
-            try:
-                joined = ",".join(extension_paths)
-                options.add_argument(f"--disable-extensions-except={joined}")
-                options.add_argument(f"--load-extension={joined}")
-            except Exception:
-                pass
         return options
 
-    def _init_driver(self, headless: bool, driver_path: Optional[str] = None, binary_path: Optional[str] = None, extension_paths: Optional[List[str]] = None):
+    def _init_driver(self, headless: bool, driver_path: Optional[str] = None, binary_path: Optional[str] = None):
         # Allow manual pin via env var (e.g., 139, 140)
         env_version = os.getenv("UC_CHROME_VERSION_MAIN")
 
@@ -372,7 +362,7 @@ class Browser:
         # Try provided/bundled driver paths with fresh options each attempt
         for p in candidate_paths:
             try:
-                opts = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
+                opts = self._build_options(headless, binary_path=binary_path)
                 return uc.Chrome(options=opts, driver_executable_path=p)
             except Exception:
                 continue
@@ -380,9 +370,9 @@ class Browser:
         # Try by version_main (from env), then default — with fresh options each time
         try:
             if env_version:
-                opts_env = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
+                opts_env = self._build_options(headless, binary_path=binary_path)
                 return uc.Chrome(options=opts_env, version_main=int(env_version))
-            opts_def = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
+            opts_def = self._build_options(headless, binary_path=binary_path)
             return uc.Chrome(options=opts_def)
         except Exception as e:
             # Attempt to parse installed Chrome major version from error and retry
@@ -391,7 +381,7 @@ class Browser:
             if m:
                 major = int(m.group(1))
                 try:
-                    opts_maj = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
+                    opts_maj = self._build_options(headless, binary_path=binary_path)
                     return uc.Chrome(options=opts_maj, version_main=major)
                 except Exception:
                     pass
@@ -399,67 +389,19 @@ class Browser:
             if headless:
                 try:
                     if env_version:
-                        opts_nh_env = self._build_options(False, binary_path=binary_path, extension_paths=extension_paths)
+                        opts_nh_env = self._build_options(False, binary_path=binary_path)
                         return uc.Chrome(options=opts_nh_env, version_main=int(env_version))
                     if m:
-                        opts_nh_maj = self._build_options(False, binary_path=binary_path, extension_paths=extension_paths)
+                        opts_nh_maj = self._build_options(False, binary_path=binary_path)
                         return uc.Chrome(options=opts_nh_maj, version_main=int(m.group(1)))
-                    opts_nh = self._build_options(False, binary_path=binary_path, extension_paths=extension_paths)
+                    opts_nh = self._build_options(False, binary_path=binary_path)
                     return uc.Chrome(options=opts_nh)
                 except Exception:
                     pass
             # Re-raise original exception if all retries fail
             raise
 
-    # ---- rrweb helpers ----
-    def inject_rrweb(self) -> bool:
-        """Inject rrweb recorder into the current page if not already present."""
-        try:
-            js = """
-            (function(){
-              if (window.__rrweb_injected) return true;
-              window.__rrweb_injected = true;
-              window.__rrweb_events = window.__rrweb_events || [];
-              function start(){
-                try{
-                  if (!window.rrweb || !window.rrweb.record) return false;
-                  if (window.__rrweb_started) return true;
-                  window.rrweb.record({
-                    emit: function(e){ try { window.__rrweb_events.push(e); } catch(_){} },
-                  });
-                  window.__rrweb_started = true;
-                  return true;
-                }catch(e){ return false; }
-              }
-              if (start()) return true;
-              var s = document.createElement('script');
-              s.src = 'https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js';
-              s.async = true;
-              s.onload = function(){ start(); };
-              (document.head||document.documentElement).appendChild(s);
-              return true;
-            })();
-            """
-            self.driver.execute_script(js)
-            return True
-        except Exception:
-            return False
-
-    def drain_rrweb_events(self) -> List[Dict]:
-        try:
-            events = self.driver.execute_script(
-                "var e=(window.__rrweb_events||[]); window.__rrweb_events=[]; return e;"
-            )
-            return events or []
-        except Exception:
-            return []
-
-    def stream_rrweb_batches(self, rounds: int = 8, delay: float = 0.25) -> Generator[List[Dict], None, None]:
-        for _ in range(max(1, rounds)):
-            evs = self.drain_rrweb_events()
-            if evs:
-                yield evs
-            time.sleep(max(0.0, delay))
+    # (rrweb helpers removed)
 
     # ---- Snapshot helpers (CSP-friendly fallbacks) ----
     def html_snapshot(self, max_len: int = 250_000) -> str:
@@ -504,8 +446,6 @@ class Browser:
             self.driver.get(url)
             self._wait_ready(20)
             time.sleep(0.8)
-            # Inject rrweb recorder ASAP
-            self.inject_rrweb()
             # Try a few selectors as DDG changes often
             anchors = []
             try:
@@ -540,8 +480,6 @@ class Browser:
             self.driver.get(url)
             self._wait_ready(timeout)
             time.sleep(1.2)  # allow dynamic content to settle
-            # Ensure rrweb is injected on this page
-            self.inject_rrweb()
             title = (self.driver.title or "").strip()
             text = self.driver.execute_script("return document.body ? document.body.innerText : '';")
             if text:
@@ -566,32 +504,15 @@ class BrowserManager:
     def start(self, conf: Dict) -> Dict:
         with self._lock:
             if self.browser is None:
-                use_ext = bool(conf.get("rrweb_use_extension"))
-                headless = conf.get("browser_headless", True)
-                # Many platforms don’t support extensions in headless; force non-headless when extension is on
-                if use_ext and headless:
-                    headless = False
-                try:
-                    self.browser = Browser(
-                        headless=headless,
-                        pageload_timeout=conf.get("browser_pageload_timeout", 25),
-                        driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
-                        binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
-                        extension_paths=[conf.get("rrweb_extension_path")] if use_ext else None,
-                    )
-                    self.extension_active = use_ext
-                except Exception:
-                    # Fallback: try without extension
-                    self.browser = Browser(
-                        headless=conf.get("browser_headless", True),
-                        pageload_timeout=conf.get("browser_pageload_timeout", 25),
-                        driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
-                        binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
-                        extension_paths=None,
-                    )
-                    self.extension_active = False
+                self.browser = Browser(
+                    headless=conf.get("browser_headless", True),
+                    pageload_timeout=conf.get("browser_pageload_timeout", 25),
+                    driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
+                    binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
+                )
+                self.extension_active = False
                 self.started_at = time.time()
-            return {"running": True, "started_at": self.started_at, "rrweb_extension_active": self.extension_active}
+            return {"running": True, "started_at": self.started_at}
 
     def stop(self) -> Dict:
         with self._lock:
@@ -605,7 +526,7 @@ class BrowserManager:
 
     def status(self) -> Dict:
         with self._lock:
-            return {"running": self.browser is not None, "started_at": self.started_at, "rrweb_extension_active": self.extension_active}
+            return {"running": self.browser is not None, "started_at": self.started_at}
 
     def get_or_start(self, conf: Dict) -> Browser:
         with self._lock:
@@ -891,12 +812,6 @@ def api_message():
                 yield sse("status", {"message": f"Searching for: {q}"})
                 results = browser.search(q, max_results=conf.get("search_results_per_query", 5))
                 yield sse("search_results", {"query": q, "results": results})
-                # Stream rrweb batches with slight delay to mimic realtime
-                try:
-                    for batch in browser.stream_rrweb_batches(rounds=6, delay=0.25):
-                        yield sse("rrweb", {"events": batch})
-                except Exception:
-                    pass
                 # Fallback previews: HTML and screenshots
                 try:
                     snap_html = browser.html_snapshot()
@@ -917,11 +832,6 @@ def api_message():
                 if page:
                     sess.scraped_pages[page["url"]] = page
                     yield sse("read_page", {"url": page["url"], "title": page["title"]})
-                    try:
-                        for batch in browser.stream_rrweb_batches(rounds=6, delay=0.25):
-                            yield sse("rrweb", {"events": batch})
-                    except Exception:
-                        pass
                     # Fallback: HTML + screenshots
                     try:
                         snap_html = browser.html_snapshot()
@@ -947,11 +857,6 @@ def api_message():
                     if page and page.get("text"):
                         sess.scraped_pages[page["url"]] = page
                         yield sse("read_page", {"url": page["url"], "title": page["title"]})
-                        try:
-                            for batch in browser.stream_rrweb_batches(rounds=6, delay=0.25):
-                                yield sse("rrweb", {"events": batch})
-                        except Exception:
-                            pass
                         # Fallback: HTML + screenshots
                         try:
                             snap_html = browser.html_snapshot()

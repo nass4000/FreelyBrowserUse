@@ -71,12 +71,7 @@
             <div class="row"><label>Dry-run (skip summarize)</label><input id="dry_run" type="checkbox" /></div>
             <div class="note">Prompts may include page extracts. Keep this off if sharing screens.</div>
           </div>
-          <div class="group">
-            <h3>Recording</h3>
-            <div class="row"><label>Use rrweb extension</label><input id="rrweb_use_extension" type="checkbox" /></div>
-            <div class="row"><label>rrweb extension path</label><input id="rrweb_extension_path" placeholder="extensions/rrweb" /></div>
-            <div class="note">Place rrweb.min.js into the extension folder. Headless Chrome may not support extensions on all platforms; disable headless if needed.</div>
-          </div>
+          
           <div class="actions">
             <button class="btn" type="submit">Save</button>
             <span id="status" class="note"></span>
@@ -109,8 +104,7 @@
           'browser_headless','browser_pageload_timeout','search_results_per_query','pages_to_open',
           'chromedriver_path','chrome_binary_path',
           'planning_temperature','planning_top_p','answer_temperature','answer_top_p','answer_max_tokens',
-          'dev_mode','dev_show_prompts','dev_show_requests','dry_run',
-          'rrweb_use_extension','rrweb_extension_path'
+          'dev_mode','dev_show_prompts','dev_show_requests','dry_run'
         ];
         ids.forEach(id => {
           const el = document.getElementById(id);
