@@ -4,6 +4,7 @@ const chatEl = document.getElementById('chat');
 const formEl = document.getElementById('chat-form');
 const inputEl = document.getElementById('chat-input');
 const startBtn = document.getElementById('btn-start');
+const restartBtn = document.getElementById('btn-restart');
 const stopBtn = document.getElementById('btn-stop');
 const browserStatusEl = document.getElementById('browser-status');
 
@@ -13,6 +14,7 @@ let streamingController = null;
 const screenshotEl = document.getElementById('page-screenshot');
 let livePreviewTimer = null;
 let lastStreamAt = 0;
+let statusTimer = null;
 
 function addUserMessage(text) {
   const m = document.createElement('div');
@@ -356,10 +358,22 @@ async function refreshBrowserStatus() {
     const res = await fetch('/api/browser/status');
     const j = await res.json();
     if (j.running) {
-      browserStatusEl.textContent = 'Browser: running';
+      const lastOkAgo = j.last_ok ? Math.max(0, Math.floor((Date.now()/1000 - j.last_ok))) : null;
+      const tail = lastOkAgo !== null ? ` (ok ${lastOkAgo}s ago)` : '';
+      browserStatusEl.textContent = 'Browser: running' + tail;
       browserStatusEl.style.background = '#16301f';
       browserStatusEl.style.borderColor = '#335f45';
       startLivePreview();
+    } else if (j.starting) {
+      browserStatusEl.textContent = 'Browser: starting…';
+      browserStatusEl.style.background = '#1e2030';
+      browserStatusEl.style.borderColor = '#3a3e60';
+      stopLivePreview();
+    } else if (j.error) {
+      browserStatusEl.textContent = `Browser error: ${j.error}`;
+      browserStatusEl.style.background = '#382323';
+      browserStatusEl.style.borderColor = '#7a3a3a';
+      stopLivePreview();
     } else {
       browserStatusEl.textContent = 'Browser: stopped';
       browserStatusEl.style.background = '#2a1c1c';
@@ -372,7 +386,22 @@ async function refreshBrowserStatus() {
 }
 
 async function startBrowser() {
-  await fetch('/api/browser/start', { method: 'POST' });
+  try {
+    // fire-and-forget; don't block UI on slow driver init
+    fetch('/api/browser/start', { method: 'POST' });
+  } catch (e) {}
+  await refreshBrowserStatus();
+}
+
+async function restartBrowser() {
+  try {
+    // non-blocking restart: triggers async start on server
+    fetch('/api/browser/restart', { method: 'POST' });
+    // hint immediately in UI; polling will take over
+    browserStatusEl.textContent = 'Browser: restarting…';
+    browserStatusEl.style.background = '#1e2030';
+    browserStatusEl.style.borderColor = '#3a3e60';
+  } catch (e) {}
   await refreshBrowserStatus();
 }
 
@@ -404,5 +433,13 @@ function stopLivePreview() {
 }
 
 startBtn?.addEventListener('click', startBrowser);
+restartBtn?.addEventListener('click', restartBrowser);
 stopBtn?.addEventListener('click', stopBrowser);
+
+function startStatusPolling() {
+  if (statusTimer) return;
+  statusTimer = setInterval(refreshBrowserStatus, 2000);
+}
+
 refreshBrowserStatus();
+startStatusPolling();

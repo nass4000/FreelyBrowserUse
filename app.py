@@ -6,6 +6,7 @@ import queue
 import threading
 import re
 import base64
+from html import unescape as html_unescape
 from typing import Dict, List, Generator, Optional
 
 from flask import Flask, Response, jsonify, render_template, request
@@ -55,6 +56,7 @@ def load_config() -> Dict:
         # Browser
         "browser_headless": _env_bool("BROWSER_HEADLESS", True),
         "browser_pageload_timeout": int(os.getenv("BROWSER_PAGELOAD_TIMEOUT", "25")),
+        "browser_start_timeout": int(os.getenv("BROWSER_START_TIMEOUT", "30")),
         "search_results_per_query": int(os.getenv("SEARCH_RESULTS_PER_QUERY", "5")),
         "pages_to_open": int(os.getenv("PAGES_TO_OPEN", "10")),
         # Binaries
@@ -502,6 +504,12 @@ class Browser:
             pass
         except WebDriverException:
             pass
+        # HTTP fallback if webdriver yields nothing or errors
+        if not results:
+            try:
+                results = self._http_search(query, max_results=max_results)
+            except Exception:
+                pass
         return results
 
     def open_and_extract(self, url: str, timeout: int = 25) -> Optional[Dict]:
@@ -520,7 +528,54 @@ class Browser:
                 text = text[:12000]
             return {"url": url, "title": title or url, "text": text or ""}
         except Exception:
-            return None
+            # Try HTTP fallback
+            try:
+                return self._http_fetch(url, timeout=timeout)
+            except Exception:
+                return None
+
+    # ---- HTTP fallbacks (no webdriver) ----
+    def _http_search(self, query: str, max_results: int = 5) -> List[Dict]:
+        q = requests.utils.quote(query)
+        # Use DDG HTML endpoint (simpler layout)
+        ddg_url = f"https://duckduckgo.com/html/?q={q}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+        r = requests.get(ddg_url, headers=headers, timeout=10)
+        r.raise_for_status()
+        html = r.text
+        # Very light extraction of results
+        out: List[Dict] = []
+        for m in re.finditer(r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.IGNORECASE|re.DOTALL):
+            href = html_unescape(m.group(1))
+            title = re.sub("<[^>]+>", "", m.group(2))
+            if not allowed_url(href):
+                continue
+            clean = normalize_url(href)
+            if any(r.get("url") == clean for r in out):
+                continue
+            out.append({"title": (title or clean).strip(), "url": clean, "snippet": ""})
+            if len(out) >= max_results:
+                break
+        return out
+
+    def _http_fetch(self, url: str, timeout: int = 20) -> Optional[Dict]:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+        r = requests.get(url, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        text = r.text or ""
+        # Extract title
+        mt = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE|re.DOTALL)
+        title = html_unescape(mt.group(1).strip()) if mt else url
+        # Remove scripts/styles
+        clean = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", "", text, flags=re.IGNORECASE|re.DOTALL)
+        clean = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", "", clean, flags=re.IGNORECASE|re.DOTALL)
+        # Strip tags to plain text
+        clean = re.sub(r"<[^>]+>", "\n", clean)
+        lines = [html_unescape(l).strip() for l in clean.splitlines()]
+        joined = "\n".join(l for l in lines if l)
+        if len(joined) > 12000:
+            joined = joined[:12000]
+        return {"url": normalize_url(url), "title": title, "text": joined}
 
 
 # -----------------------------
@@ -532,6 +587,12 @@ class BrowserManager:
         self.browser: Optional[Browser] = None
         self.started_at: Optional[float] = None
         self.extension_active: bool = False
+        self._last_ok: Optional[float] = None
+        self._starting: bool = False
+        self._start_error: Optional[str] = None
+        self._start_thread: Optional[threading.Thread] = None
+        self._start_started_at: Optional[float] = None
+        self._start_seq: int = 0
 
     def start(self, conf: Dict) -> Dict:
         with self._lock:
@@ -544,7 +605,57 @@ class BrowserManager:
                 )
                 self.extension_active = False
                 self.started_at = time.time()
-            return {"running": True, "started_at": self.started_at}
+                # Touch driver to record first ok
+                try:
+                    self.browser.driver.execute_script("return 1;")
+                    self._last_ok = time.time()
+                except Exception:
+                    self._last_ok = None
+            return {"running": True, "started_at": self.started_at, "last_ok": self._last_ok, "starting": False, "error": None}
+
+    def _start_worker(self, conf: Dict):
+        # Deprecated: kept for compatibility if called directly
+        self._start_worker_with_seq(conf, None)
+
+    def _start_worker_with_seq(self, conf: Dict, seq: Optional[int]):
+        try:
+            self.start(conf)
+            with self._lock:
+                # Ignore completion if superseded
+                if seq is not None and seq != self._start_seq:
+                    return
+                self._starting = False
+                self._start_error = None
+                self._start_thread = None
+                self._start_started_at = None
+        except Exception as e:
+            with self._lock:
+                if seq is not None and seq != self._start_seq:
+                    return
+                self._starting = False
+                self._start_error = str(e)
+                self._start_thread = None
+                self._start_started_at = None
+                # ensure cleared
+                self.browser = None
+                self.started_at = None
+                self._last_ok = None
+
+    def start_async(self, conf: Dict) -> Dict:
+        with self._lock:
+            if self.browser is not None:
+                return {"running": True, "started_at": self.started_at, "last_ok": self._last_ok, "starting": False, "error": None}
+            if self._starting and self._start_thread and self._start_thread.is_alive():
+                return {"running": False, "started_at": None, "last_ok": None, "starting": True, "error": self._start_error}
+            # kick off background start
+            self._starting = True
+            self._start_error = None
+            self._start_seq += 1
+            seq = self._start_seq
+            self._start_started_at = time.time()
+            self._start_thread = threading.Thread(target=self._start_worker_with_seq, args=(conf, seq), daemon=True)
+            self._start_thread.start()
+            return {"running": False, "started_at": None, "last_ok": None, "starting": True, "error": None}
 
     def stop(self) -> Dict:
         with self._lock:
@@ -554,17 +665,69 @@ class BrowserManager:
                 finally:
                     self.browser = None
                     self.started_at = None
-            return {"running": False}
+                    self._last_ok = None
+                    self._starting = False
+                    self._start_error = None
+            return {"running": False, "started_at": None, "last_ok": None, "starting": False, "error": None}
 
     def status(self) -> Dict:
         with self._lock:
-            return {"running": self.browser is not None, "started_at": self.started_at}
+            running = False
+            if self.browser is not None:
+                try:
+                    # Lightweight ping to ensure driver/session is alive
+                    self.browser.driver.execute_script("return 1;")
+                    running = True
+                    self._last_ok = time.time()
+                except Exception:
+                    # Mark as not running if driver died
+                    running = False
+            # Apply startup timeout
+            if not running and self._starting:
+                try:
+                    timeout_s = int(CONFIG.get("browser_start_timeout", 30))
+                except Exception:
+                    timeout_s = 30
+                if self._start_started_at and (time.time() - self._start_started_at) > timeout_s:
+                    # mark as failed due to timeout; drop reference to stale thread
+                    self._starting = False
+                    self._start_error = f"Startup timed out after {timeout_s}s. Check Chrome binary path and driver compatibility."
+                    self._start_thread = None
+                    self._start_started_at = None
+            return {"running": running, "started_at": self.started_at, "last_ok": self._last_ok, "starting": self._starting, "error": self._start_error}
 
     def get_or_start(self, conf: Dict) -> Browser:
         with self._lock:
+            # Start if missing and allowed
             if self.browser is None and conf.get("browser_autostart", True):
-                # Reuse start() logic
                 self.start(conf)
+
+            # If we have a browser, verify it's alive; if not, recycle
+            if self.browser is not None:
+                try:
+                    self.browser.driver.execute_script("return 1;")
+                    self._last_ok = time.time()
+                except Exception:
+                    # Try to rebuild driver once
+                    try:
+                        self.browser.quit()
+                    except Exception:
+                        pass
+                    try:
+                        self.browser = Browser(
+                            headless=conf.get("browser_headless", True),
+                            pageload_timeout=conf.get("browser_pageload_timeout", 25),
+                            driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
+                            binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
+                        )
+                        self.started_at = time.time()
+                        self._last_ok = self.started_at
+                    except Exception as e:
+                        self.browser = None
+                        self.started_at = None
+                        self._last_ok = None
+                        raise RuntimeError(f"Failed to restart browser: {e}")
+
             if self.browser is None:
                 raise RuntimeError("Browser is not running. Start it from the Settings/Controls panel.")
             return self.browser
@@ -745,10 +908,36 @@ def get_cached_html(cache_id: str):
 def browser_status():
     return jsonify(BROWSER_MANAGER.status())
 
+@app.get("/api/browser/diagnose")
+def browser_diagnose():
+    info = BROWSER_MANAGER.status().copy()
+    diag = {"candidate_paths": [], "chrome_binary": CONFIG.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH")}
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        win_path = os.path.join(base_dir, "bin", "chromedriver.exe")
+        nix_path = os.path.join(base_dir, "bin", "chromedriver")
+        for p in [CONFIG.get("chromedriver_path"), os.getenv("CHROMEDRIVER_PATH"), win_path, nix_path]:
+            if p and os.path.exists(p):
+                diag["candidate_paths"].append({"path": p, "exists": True})
+            elif p:
+                diag["candidate_paths"].append({"path": p, "exists": False})
+    except Exception:
+        pass
+    # quick network probe
+    net = {"duckduckgo": None}
+    try:
+        r = requests.get("https://duckduckgo.com/", timeout=5)
+        net["duckduckgo"] = (r.status_code, len(r.text))
+    except Exception as e:
+        net["duckduckgo"] = str(e)
+    info["diagnose"] = {"paths": diag, "net": net}
+    return jsonify(info)
+
 @app.post("/api/browser/start")
 def browser_start():
     try:
-        status = BROWSER_MANAGER.start(CONFIG)
+        # Start without blocking the request
+        status = BROWSER_MANAGER.start_async(CONFIG)
         return jsonify({"ok": True, **status})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -757,6 +946,15 @@ def browser_start():
 def browser_stop():
     try:
         status = BROWSER_MANAGER.stop()
+        return jsonify({"ok": True, **status})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.post("/api/browser/restart")
+def browser_restart():
+    try:
+        BROWSER_MANAGER.stop()
+        status = BROWSER_MANAGER.start_async(CONFIG)
         return jsonify({"ok": True, **status})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -848,16 +1046,28 @@ def api_message():
             yield sse("trace", {"phase": "plan", "message": "Plan created", "steps": plan.get("steps", [])})
 
             # ACT
-            # Ensure persistent browser is running
-            browser = BROWSER_MANAGER.get_or_start(conf)
+            # Ensure persistent browser is running (fall back to HTTP if unavailable)
+            browser = None
+            try:
+                browser = BROWSER_MANAGER.get_or_start(conf)
+            except Exception as e:
+                yield sse("status", {"message": f"Browser unavailable, using HTTP fallback. ({e})"})
             collected_results: List[Dict] = []
             yield sse("trace", {"phase": "act", "message": "Executing search queries", "queries": plan["queries"]})
             for q in plan["queries"][:4]:
                 yield sse("status", {"message": f"Searching for: {q}"})
-                results = browser.search(q, max_results=conf.get("search_results_per_query", 5))
+                if browser:
+                    results = browser.search(q, max_results=conf.get("search_results_per_query", 5))
+                else:
+                    try:
+                        results = Browser._http_search(self=None, query=q, max_results=conf.get("search_results_per_query", 5))  # type: ignore
+                    except Exception:
+                        results = []
                 yield sse("search_results", {"query": q, "results": results})
                 # Fallback previews: HTML and screenshots
                 try:
+                    if not browser:
+                        raise RuntimeError("no_browser")
                     frames = max(3, int(conf.get("preview_frames", 24)))
                     delay = max(0.05, float(conf.get("preview_delay", 0.15)))
                     if conf.get("preview_enable_pan", True):
@@ -874,12 +1084,20 @@ def api_message():
             pages_to_read: List[Dict] = []
             if clicked_url and allowed_url(clicked_url):
                 yield sse("status", {"message": "Opening user-selected page..."})
-                page = browser.open_and_extract(clicked_url)
+                if browser:
+                    page = browser.open_and_extract(clicked_url)
+                else:
+                    try:
+                        page = Browser._http_fetch(self=None, url=clicked_url, timeout=conf.get("browser_pageload_timeout", 25))  # type: ignore
+                    except Exception:
+                        page = None
                 if page:
                     sess.scraped_pages[page["url"]] = page
                     yield sse("read_page", {"url": page["url"], "title": page["title"]})
                     # Fallback: HTML + screenshots
                     try:
+                        if not browser:
+                            raise RuntimeError("no_browser")
                         frames = max(5, int(conf.get("preview_frames", 24)))
                         delay = max(0.05, float(conf.get("preview_delay", 0.15)))
                         if conf.get("preview_enable_pan", True):
@@ -901,12 +1119,20 @@ def api_message():
                     url = r.get("url")
                     if not url or url in sess.scraped_pages:
                         continue
-                    page = browser.open_and_extract(url)
+                    if browser:
+                        page = browser.open_and_extract(url)
+                    else:
+                        try:
+                            page = Browser._http_fetch(self=None, url=url, timeout=conf.get("browser_pageload_timeout", 25))  # type: ignore
+                        except Exception:
+                            page = None
                     if page and page.get("text"):
                         sess.scraped_pages[page["url"]] = page
                         yield sse("read_page", {"url": page["url"], "title": page["title"]})
                         # Fallback: HTML + screenshots
                         try:
+                            if not browser:
+                                raise RuntimeError("no_browser")
                             frames = max(5, int(conf.get("preview_frames", 24)))
                             delay = max(0.05, float(conf.get("preview_delay", 0.15)))
                             if conf.get("preview_enable_pan", True):
@@ -979,4 +1205,4 @@ def api_message():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=True)
