@@ -5,6 +5,7 @@ import uuid
 import queue
 import threading
 import re
+import base64
 from typing import Dict, List, Generator, Optional
 
 from flask import Flask, Response, jsonify, render_template, request
@@ -59,6 +60,21 @@ def load_config() -> Dict:
         # Binaries
         "chromedriver_path": os.getenv("CHROMEDRIVER_PATH", ""),
         "chrome_binary_path": os.getenv("CHROME_BINARY_PATH", ""),
+        # Dev / advanced
+        "dev_mode": _env_bool("DEV_MODE", False),
+        "dev_show_prompts": _env_bool("DEV_SHOW_PROMPTS", True),
+        "dev_show_requests": _env_bool("DEV_SHOW_REQUESTS", False),
+        "dry_run": _env_bool("DRY_RUN", False),
+        "browser_autostart": _env_bool("BROWSER_AUTOSTART", True),
+        # LLM params
+        "planning_temperature": float(os.getenv("PLANNING_TEMPERATURE", "0.2")),
+        "planning_top_p": float(os.getenv("PLANNING_TOP_P", "1.0")),
+        "answer_temperature": float(os.getenv("ANSWER_TEMPERATURE", "0.2")),
+        "answer_top_p": float(os.getenv("ANSWER_TOP_P", "1.0")),
+        "answer_max_tokens": int(os.getenv("ANSWER_MAX_TOKENS", "1200")),
+        # rrweb extension
+        "rrweb_use_extension": _env_bool("RRWEB_USE_EXTENSION", False),
+        "rrweb_extension_path": os.getenv("RRWEB_EXTENSION_PATH", os.path.join(os.getcwd(), "extensions", "rrweb")),
     }
     # Overlay with config file if present
     try:
@@ -96,6 +112,30 @@ class AgentSession:
 
 
 SESSIONS: Dict[str, AgentSession] = {}
+
+# Cached HTML snapshots
+CACHED_HTML: Dict[str, Dict] = {}
+
+def cache_html_snapshot(html: str, url: str = "", title: str = "") -> str:
+    cid = str(uuid.uuid4())
+    CACHED_HTML[cid] = {
+        "html": html or "",
+        "url": url or "",
+        "title": title or "",
+        "created_at": time.time(),
+    }
+    return cid
+
+def _sanitize_snapshot(html: str) -> str:
+    try:
+        # Remove script tags
+        html = re.sub(r"<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>", "", html, flags=re.IGNORECASE | re.DOTALL)
+        # Remove on* attributes (simple pass)
+        html = re.sub(r"\son[a-zA-Z]+=\"[^\"]*\"", "", html)
+        html = re.sub(r"\son[a-zA-Z]+='[^']*'", "", html)
+    except Exception:
+        pass
+    return html
 
 
 # -----------------------------
@@ -168,7 +208,7 @@ class OpenRouterClient:
                 m = m.split("/")[-1]
         return m
 
-    def _post_chat(self, api_key: str, base_url: str, messages: List[Dict], model: str, stream: bool) -> requests.Response:
+    def _post_chat(self, api_key: str, base_url: str, messages: List[Dict], model: str, stream: bool, extra_params: Optional[Dict] = None) -> requests.Response:
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -178,20 +218,22 @@ class OpenRouterClient:
         }
         resolved_model = self._resolve_model(base_url, model)
         payload = {"model": resolved_model, "messages": messages, "temperature": 0.2, "stream": stream}
+        if extra_params:
+            payload.update({k: v for k, v in extra_params.items() if v is not None})
         resp = requests.post(url, headers=headers, json=payload, stream=stream, timeout=60)
         resp.raise_for_status()
         return resp
 
-    def chat(self, messages: List[Dict], model: str, stream: bool = False) -> requests.Response:
-        return self._post_chat(self.api_key, self.base_url, messages, model, stream)
+    def chat(self, messages: List[Dict], model: str, stream: bool = False, extra_params: Optional[Dict] = None) -> requests.Response:
+        return self._post_chat(self.api_key, self.base_url, messages, model, stream, extra_params=extra_params)
 
-    def stream_chat_text(self, messages: List[Dict], model: str) -> Generator[dict, None, None]:
+    def stream_chat_text(self, messages: List[Dict], model: str, extra_params: Optional[Dict] = None) -> Generator[dict, None, None]:
         """Yield dict events: {event: 'meta'|'token'|'usage'|'error', ...}"""
         def emit_error(msg: str):
             yield {"event": "error", "message": msg}
 
         try:
-            resp = self.chat(messages, model=model, stream=True)
+            resp = self.chat(messages, model=model, stream=True, extra_params=extra_params)
             meta = {
                 "model": model,
                 "base_url": self.base_url,
@@ -216,9 +258,14 @@ class OpenRouterClient:
                         if "usage" in obj:
                             last_usage = obj["usage"]
                         delta = obj.get("choices", [{}])[0].get("delta", {})
+                        # Stream content tokens (may be HTML)
                         content = delta.get("content")
                         if content:
                             yield {"event": "token", "text": content}
+                        # Some providers stream separate reasoning/thinking tokens
+                        reasoning = delta.get("reasoning") or delta.get("thought") or delta.get("thinking")
+                        if reasoning:
+                            yield {"event": "thinking", "text": reasoning}
                     except Exception:
                         continue
             if last_usage:
@@ -233,19 +280,23 @@ class OpenRouterClient:
             if "Model Not Exist" in body or "invalid_request_error" in body:
                 hint = " Tip: check that your base URL matches the model vendor (e.g., deepseek.com with 'deepseek-chat' or use openrouter.ai with 'deepseek/deepseek-reasoner')."
             yield from emit_error(f"LLM HTTP error: {he} | {body}{hint}")
-            yield from self._fallback_chat(messages, model)
+            yield from self._fallback_chat(messages, model, extra_params=extra_params)
         except Exception as e:
             yield from emit_error(f"LLM error: {e}")
-            yield from self._fallback_chat(messages, model)
+            yield from self._fallback_chat(messages, model, extra_params=extra_params)
 
-    def _fallback_chat(self, messages: List[Dict], model: str) -> Generator[dict, None, None]:
+    def _fallback_chat(self, messages: List[Dict], model: str, extra_params: Optional[Dict] = None) -> Generator[dict, None, None]:
         def nonstream_once(m: str, api_key: str, base_url: str):
-            resp = self._post_chat(api_key, base_url, messages, m, stream=False)
+            resp = self._post_chat(api_key, base_url, messages, m, stream=False, extra_params=extra_params)
             obj = resp.json()
-            content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+            message_obj = obj.get("choices", [{}])[0].get("message", {})
+            content = message_obj.get("content", "")
+            reasoning = message_obj.get("reasoning") or message_obj.get("thinking")
             usage = obj.get("usage")
             if content:
                 yield {"event": "token", "text": content}
+            if reasoning:
+                yield {"event": "thinking", "text": reasoning}
             if usage:
                 yield {"event": "usage", "usage": usage, "model": m}
 
@@ -269,11 +320,11 @@ class OpenRouterClient:
 # Headless Browser Wrapper (undetected_chromedriver + Selenium)
 # -----------------------------
 class Browser:
-    def __init__(self, headless: bool = True, pageload_timeout: int = 25, driver_path: Optional[str] = None, binary_path: Optional[str] = None):
-        self.driver = self._init_driver(headless, driver_path=driver_path, binary_path=binary_path)
+    def __init__(self, headless: bool = True, pageload_timeout: int = 25, driver_path: Optional[str] = None, binary_path: Optional[str] = None, extension_paths: Optional[List[str]] = None):
+        self.driver = self._init_driver(headless, driver_path=driver_path, binary_path=binary_path, extension_paths=extension_paths)
         self.driver.set_page_load_timeout(pageload_timeout)
 
-    def _build_options(self, headless: bool, binary_path: Optional[str] = None):
+    def _build_options(self, headless: bool, binary_path: Optional[str] = None, extension_paths: Optional[List[str]] = None):
         options = uc.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
@@ -282,15 +333,23 @@ class Browser:
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1280,800")
-        options.add_argument("--incognito")
+        if not extension_paths:
+            options.add_argument("--incognito")
         if binary_path:
             try:
                 options.binary_location = binary_path
             except Exception:
                 pass
+        if extension_paths:
+            try:
+                joined = ",".join(extension_paths)
+                options.add_argument(f"--disable-extensions-except={joined}")
+                options.add_argument(f"--load-extension={joined}")
+            except Exception:
+                pass
         return options
 
-    def _init_driver(self, headless: bool, driver_path: Optional[str] = None, binary_path: Optional[str] = None):
+    def _init_driver(self, headless: bool, driver_path: Optional[str] = None, binary_path: Optional[str] = None, extension_paths: Optional[List[str]] = None):
         # Allow manual pin via env var (e.g., 139, 140)
         env_version = os.getenv("UC_CHROME_VERSION_MAIN")
 
@@ -313,7 +372,7 @@ class Browser:
         # Try provided/bundled driver paths with fresh options each attempt
         for p in candidate_paths:
             try:
-                opts = self._build_options(headless, binary_path=binary_path)
+                opts = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
                 return uc.Chrome(options=opts, driver_executable_path=p)
             except Exception:
                 continue
@@ -321,9 +380,9 @@ class Browser:
         # Try by version_main (from env), then default — with fresh options each time
         try:
             if env_version:
-                opts_env = self._build_options(headless, binary_path=binary_path)
+                opts_env = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
                 return uc.Chrome(options=opts_env, version_main=int(env_version))
-            opts_def = self._build_options(headless, binary_path=binary_path)
+            opts_def = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
             return uc.Chrome(options=opts_def)
         except Exception as e:
             # Attempt to parse installed Chrome major version from error and retry
@@ -332,7 +391,7 @@ class Browser:
             if m:
                 major = int(m.group(1))
                 try:
-                    opts_maj = self._build_options(headless, binary_path=binary_path)
+                    opts_maj = self._build_options(headless, binary_path=binary_path, extension_paths=extension_paths)
                     return uc.Chrome(options=opts_maj, version_main=major)
                 except Exception:
                     pass
@@ -340,17 +399,91 @@ class Browser:
             if headless:
                 try:
                     if env_version:
-                        opts_nh_env = self._build_options(False, binary_path=binary_path)
+                        opts_nh_env = self._build_options(False, binary_path=binary_path, extension_paths=extension_paths)
                         return uc.Chrome(options=opts_nh_env, version_main=int(env_version))
                     if m:
-                        opts_nh_maj = self._build_options(False, binary_path=binary_path)
+                        opts_nh_maj = self._build_options(False, binary_path=binary_path, extension_paths=extension_paths)
                         return uc.Chrome(options=opts_nh_maj, version_main=int(m.group(1)))
-                    opts_nh = self._build_options(False, binary_path=binary_path)
+                    opts_nh = self._build_options(False, binary_path=binary_path, extension_paths=extension_paths)
                     return uc.Chrome(options=opts_nh)
                 except Exception:
                     pass
             # Re-raise original exception if all retries fail
             raise
+
+    # ---- rrweb helpers ----
+    def inject_rrweb(self) -> bool:
+        """Inject rrweb recorder into the current page if not already present."""
+        try:
+            js = """
+            (function(){
+              if (window.__rrweb_injected) return true;
+              window.__rrweb_injected = true;
+              window.__rrweb_events = window.__rrweb_events || [];
+              function start(){
+                try{
+                  if (!window.rrweb || !window.rrweb.record) return false;
+                  if (window.__rrweb_started) return true;
+                  window.rrweb.record({
+                    emit: function(e){ try { window.__rrweb_events.push(e); } catch(_){} },
+                  });
+                  window.__rrweb_started = true;
+                  return true;
+                }catch(e){ return false; }
+              }
+              if (start()) return true;
+              var s = document.createElement('script');
+              s.src = 'https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js';
+              s.async = true;
+              s.onload = function(){ start(); };
+              (document.head||document.documentElement).appendChild(s);
+              return true;
+            })();
+            """
+            self.driver.execute_script(js)
+            return True
+        except Exception:
+            return False
+
+    def drain_rrweb_events(self) -> List[Dict]:
+        try:
+            events = self.driver.execute_script(
+                "var e=(window.__rrweb_events||[]); window.__rrweb_events=[]; return e;"
+            )
+            return events or []
+        except Exception:
+            return []
+
+    def stream_rrweb_batches(self, rounds: int = 8, delay: float = 0.25) -> Generator[List[Dict], None, None]:
+        for _ in range(max(1, rounds)):
+            evs = self.drain_rrweb_events()
+            if evs:
+                yield evs
+            time.sleep(max(0.0, delay))
+
+    # ---- Snapshot helpers (CSP-friendly fallbacks) ----
+    def html_snapshot(self, max_len: int = 250_000) -> str:
+        try:
+            html = self.driver.execute_script("return document.documentElement ? document.documentElement.outerHTML : '';")
+            if html and len(html) > max_len:
+                return html[:max_len]
+            return html or ""
+        except Exception:
+            return ""
+
+    def screenshot_b64(self) -> Optional[str]:
+        try:
+            png = self.driver.get_screenshot_as_png()
+            return base64.b64encode(png).decode('ascii')
+        except Exception:
+            return None
+
+    def stream_screenshots(self, frames: int = 6, delay: float = 0.35) -> Generator[str, None, None]:
+        for _ in range(max(1, frames)):
+            b64 = self.screenshot_b64()
+            if b64:
+                yield b64
+            time.sleep(max(0.0, delay))
 
     def quit(self):
         try:
@@ -371,6 +504,8 @@ class Browser:
             self.driver.get(url)
             self._wait_ready(20)
             time.sleep(0.8)
+            # Inject rrweb recorder ASAP
+            self.inject_rrweb()
             # Try a few selectors as DDG changes often
             anchors = []
             try:
@@ -405,6 +540,8 @@ class Browser:
             self.driver.get(url)
             self._wait_ready(timeout)
             time.sleep(1.2)  # allow dynamic content to settle
+            # Ensure rrweb is injected on this page
+            self.inject_rrweb()
             title = (self.driver.title or "").strip()
             text = self.driver.execute_script("return document.body ? document.body.innerText : '';")
             if text:
@@ -417,20 +554,91 @@ class Browser:
 
 
 # -----------------------------
+# Persistent Browser Manager
+# -----------------------------
+class BrowserManager:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.browser: Optional[Browser] = None
+        self.started_at: Optional[float] = None
+        self.extension_active: bool = False
+
+    def start(self, conf: Dict) -> Dict:
+        with self._lock:
+            if self.browser is None:
+                use_ext = bool(conf.get("rrweb_use_extension"))
+                headless = conf.get("browser_headless", True)
+                # Many platforms don’t support extensions in headless; force non-headless when extension is on
+                if use_ext and headless:
+                    headless = False
+                try:
+                    self.browser = Browser(
+                        headless=headless,
+                        pageload_timeout=conf.get("browser_pageload_timeout", 25),
+                        driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
+                        binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
+                        extension_paths=[conf.get("rrweb_extension_path")] if use_ext else None,
+                    )
+                    self.extension_active = use_ext
+                except Exception:
+                    # Fallback: try without extension
+                    self.browser = Browser(
+                        headless=conf.get("browser_headless", True),
+                        pageload_timeout=conf.get("browser_pageload_timeout", 25),
+                        driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
+                        binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
+                        extension_paths=None,
+                    )
+                    self.extension_active = False
+                self.started_at = time.time()
+            return {"running": True, "started_at": self.started_at, "rrweb_extension_active": self.extension_active}
+
+    def stop(self) -> Dict:
+        with self._lock:
+            if self.browser:
+                try:
+                    self.browser.quit()
+                finally:
+                    self.browser = None
+                    self.started_at = None
+            return {"running": False}
+
+    def status(self) -> Dict:
+        with self._lock:
+            return {"running": self.browser is not None, "started_at": self.started_at, "rrweb_extension_active": self.extension_active}
+
+    def get_or_start(self, conf: Dict) -> Browser:
+        with self._lock:
+            if self.browser is None and conf.get("browser_autostart", True):
+                # Reuse start() logic
+                self.start(conf)
+            if self.browser is None:
+                raise RuntimeError("Browser is not running. Start it from the Settings/Controls panel.")
+            return self.browser
+
+
+BROWSER_MANAGER = BrowserManager()
+
+
+# -----------------------------
 # Agent logic (Plan -> Act -> Summarize)
 # -----------------------------
 class ResearchAgent:
-    def __init__(self, planning_llm: OpenRouterClient, answer_llm: OpenRouterClient, planning_model: str, answer_model: str):
+    def __init__(self, planning_llm: OpenRouterClient, answer_llm: OpenRouterClient, planning_model: str, answer_model: str,
+                 planning_params: Optional[Dict] = None, answer_params: Optional[Dict] = None, dev_show_prompts: bool = True):
         self.planning_llm = planning_llm
         self.answer_llm = answer_llm
         self.planning_model = planning_model
         self.answer_model = answer_model
+        self.planning_params = planning_params or {}
+        self.answer_params = answer_params or {}
+        self.dev_show_prompts = dev_show_prompts
 
     def make_plan(self, question: str) -> Dict:
         sys_prompt = (
             "You are a research planner. Given a user question, create a concise plan with: "
             "1) 2-4 specific web search queries, 2) short ordered steps to validate facts across multiple sources.\n"
-            "Return strict JSON with keys: 'queries' (array of strings) and 'steps' (array of strings)."
+            "Return strict JSON with keys: 'queries' (array of strings), 'steps' (array of strings), and 'rationale' (1-2 sentence high-level justification)."
         )
         user = f"Question: {question}\nReturn only JSON."
         messages = [
@@ -439,7 +647,7 @@ class ResearchAgent:
         ]
         # Non-streaming small call for planning
         try:
-            resp = self.planning_llm.chat(messages, model=self.planning_model, stream=False)
+            resp = self.planning_llm.chat(messages, model=self.planning_model, stream=False, extra_params=self.planning_params)
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
             plan = json.loads(self._extract_json(content))
@@ -448,14 +656,15 @@ class ResearchAgent:
             if not isinstance(queries, list) or not queries:
                 queries = [question]
             usage = data.get("usage")
-            return {"queries": [sanitize_query(q) for q in queries][:4], "steps": steps[:6]}, usage
+            debug = {"phase": "plan", "model": self.planning_model, "messages": messages}
+            return {"queries": [sanitize_query(q) for q in queries][:4], "steps": steps[:6], "rationale": plan.get("rationale")}, usage, debug
         except Exception:
             # Fallback plan
             base = sanitize_query(question)
             return {
                 "queries": [base, f"site:.gov {base}", f"site:.edu {base}"],
                 "steps": ["Search the web", "Open top sources", "Cross-verify facts", "Summarize with citations"],
-            }, None
+            }, None, None
 
     def _extract_json(self, content: str) -> str:
         # Try to extract a JSON object from text
@@ -469,7 +678,7 @@ class ResearchAgent:
             return content[start : end + 1]
         return "{}"
 
-    def summarize_stream(self, question: str, sources: List[Dict]) -> Generator[str, None, None]:
+    def summarize_stream(self, question: str, sources: List[Dict]) -> Generator[dict, None, None]:
         # Build a compact context with enumerated sources
         numbered = []
         for i, s in enumerate(sources, 1):
@@ -480,7 +689,9 @@ class ResearchAgent:
 
         sys_prompt = (
             "You are a helpful research assistant. Use only the provided sources to answer. "
-            "Cite using [n] where n is the source number. Provide a concise, clear, and accurate answer."
+            "Return VALID, minimal HTML only (no style/script). Use <p>, <ul>, <ol>, <li>, <a>, <code>, <pre>, <blockquote>, <h3>-<h5>, <br>. "
+            "Begin with a single-sentence <p><em>Approach:</em> ...</p> that states your method without exposing hidden chain-of-thought. "
+            "Cite using [n] where n is the source number, and include a final <h4>Sources</h4><ul> list linking to each URL with anchors."
         )
         user_msg = (
             f"Question: {question}\n\nSources (numbered):\n{context}\n\n"
@@ -490,7 +701,8 @@ class ResearchAgent:
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_msg},
         ]
-        return self.answer_llm.stream_chat_text(messages, model=self.answer_model)
+        yield {"event": "prompt", "phase": "answer", "model": self.answer_model, "messages": messages}
+        yield from self.answer_llm.stream_chat_text(messages, model=self.answer_model, extra_params=self.answer_params)
 
 
 # -----------------------------
@@ -520,6 +732,81 @@ def post_settings():
     CONFIG.update(data)
     save_config(CONFIG)
     return jsonify({"ok": True, "config": CONFIG})
+
+@app.get("/api/health")
+def api_health():
+    import platform
+    info = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "packages": {},
+    }
+    try:
+        import selenium
+        info["packages"]["selenium"] = getattr(selenium, "__version__", "?")
+    except Exception:
+        pass
+    try:
+        import undetected_chromedriver as uc_mod
+        info["packages"]["undetected_chromedriver"] = getattr(uc_mod, "__version__", "?")
+    except Exception:
+        pass
+    try:
+        import requests as rq
+        info["packages"]["requests"] = getattr(rq, "__version__", "?")
+    except Exception:
+        pass
+    return jsonify({"ok": True, "health": info})
+
+@app.get("/cache/<cache_id>")
+def get_cached_html(cache_id: str):
+    item = CACHED_HTML.get(cache_id)
+    if not item:
+        return "Not found", 404
+    raw = item.get("html", "")
+    url = item.get("url", "")
+    title = item.get("title", "Cached Page")
+    # Inject <base> for relative links if there's a head tag
+    html = _sanitize_snapshot(raw)
+    try:
+        if "<head" in html.lower():
+            # Insert base after first head tag
+            html = re.sub(
+                r"(<head[^>]*>)",
+                r"\1\n<base href=\"%s\">" % (url.replace("\"", "&quot;")),
+                html,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        else:
+            # Wrap into minimal doc
+            html = (
+                f"<!doctype html><html><head><meta charset='utf-8'><base href='{url}'><title>{title}</title></head>"
+                f"<body>{html}</body></html>"
+            )
+    except Exception:
+        pass
+    return Response(html, headers={"Content-Type": "text/html; charset=utf-8"})
+
+@app.get("/api/browser/status")
+def browser_status():
+    return jsonify(BROWSER_MANAGER.status())
+
+@app.post("/api/browser/start")
+def browser_start():
+    try:
+        status = BROWSER_MANAGER.start(CONFIG)
+        return jsonify({"ok": True, **status})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.post("/api/browser/stop")
+def browser_stop():
+    try:
+        status = BROWSER_MANAGER.stop()
+        return jsonify({"ok": True, **status})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.post("/api/message")
@@ -562,33 +849,64 @@ def api_message():
             yield sse("error", {"message": f"LLM init failed: {e}"})
             return
         
-        agent = ResearchAgent(planning_llm, answer_llm, planning_model=conf["planning_model"], answer_model=conf["answer_model"])
+        agent = ResearchAgent(
+            planning_llm,
+            answer_llm,
+            planning_model=conf["planning_model"],
+            answer_model=conf["answer_model"],
+            planning_params={
+                "temperature": conf.get("planning_temperature"),
+                "top_p": conf.get("planning_top_p"),
+            },
+            answer_params={
+                "temperature": conf.get("answer_temperature"),
+                "top_p": conf.get("answer_top_p"),
+                "max_tokens": conf.get("answer_max_tokens"),
+            },
+            dev_show_prompts=conf.get("dev_show_prompts", False),
+        )
         browser = None
         try:
             # PLAN
             yield sse("status", {"message": "Planning research steps..."})
-            plan, plan_usage = agent.make_plan(user_message)
+            plan, plan_usage, plan_debug = agent.make_plan(user_message)
             sess.plan = plan
             # Planning meta and usage events
             yield sse("llm_meta", {"phase": "plan", "model": conf["planning_model"], "base_url": conf["planning_base_url"]})
             if plan_usage:
                 yield sse("usage", {"phase": "plan", "usage": plan_usage, "model": conf["planning_model"]})
+            if plan.get("rationale"):
+                yield sse("thinking", {"phase": "plan", "text": plan.get("rationale")})
+            if plan_debug:
+                yield sse("prompt", plan_debug)
             yield sse("plan", plan)
             yield sse("trace", {"phase": "plan", "message": "Plan created", "steps": plan.get("steps", [])})
 
             # ACT
-            browser = Browser(
-                headless=conf.get("browser_headless", True),
-                pageload_timeout=conf.get("browser_pageload_timeout", 25),
-                driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
-                binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
-            )
+            # Ensure persistent browser is running
+            browser = BROWSER_MANAGER.get_or_start(conf)
             collected_results: List[Dict] = []
             yield sse("trace", {"phase": "act", "message": "Executing search queries", "queries": plan["queries"]})
             for q in plan["queries"][:4]:
                 yield sse("status", {"message": f"Searching for: {q}"})
                 results = browser.search(q, max_results=conf.get("search_results_per_query", 5))
                 yield sse("search_results", {"query": q, "results": results})
+                # Stream rrweb batches with slight delay to mimic realtime
+                try:
+                    for batch in browser.stream_rrweb_batches(rounds=6, delay=0.25):
+                        yield sse("rrweb", {"events": batch})
+                except Exception:
+                    pass
+                # Fallback previews: HTML and screenshots
+                try:
+                    snap_html = browser.html_snapshot()
+                    if snap_html:
+                        cid = cache_html_snapshot(snap_html, getattr(browser.driver, 'current_url', ''), browser.driver.title)
+                        yield sse("page_cached", {"url": f"/cache/{cid}", "cache_id": cid, "title": browser.driver.title})
+                    for frame in browser.stream_screenshots(frames=3, delay=0.4):
+                        yield sse("screenshot", {"b64": frame})
+                except Exception:
+                    pass
                 collected_results.extend(results)
 
             # If user clicked a link, prioritize it
@@ -599,6 +917,21 @@ def api_message():
                 if page:
                     sess.scraped_pages[page["url"]] = page
                     yield sse("read_page", {"url": page["url"], "title": page["title"]})
+                    try:
+                        for batch in browser.stream_rrweb_batches(rounds=6, delay=0.25):
+                            yield sse("rrweb", {"events": batch})
+                    except Exception:
+                        pass
+                    # Fallback: HTML + screenshots
+                    try:
+                        snap_html = browser.html_snapshot()
+                        if snap_html:
+                            cid = cache_html_snapshot(snap_html, page["url"], page["title"])
+                            yield sse("page_cached", {"url": f"/cache/{cid}", "cache_id": cid, "title": page["title"]})
+                        for frame in browser.stream_screenshots(frames=5, delay=0.35):
+                            yield sse("screenshot", {"b64": frame})
+                    except Exception:
+                        pass
                     pages_to_read.append(page)
 
             # Auto-open top results if we still need context
@@ -614,6 +947,21 @@ def api_message():
                     if page and page.get("text"):
                         sess.scraped_pages[page["url"]] = page
                         yield sse("read_page", {"url": page["url"], "title": page["title"]})
+                        try:
+                            for batch in browser.stream_rrweb_batches(rounds=6, delay=0.25):
+                                yield sse("rrweb", {"events": batch})
+                        except Exception:
+                            pass
+                        # Fallback: HTML + screenshots
+                        try:
+                            snap_html = browser.html_snapshot()
+                            if snap_html:
+                                cid = cache_html_snapshot(snap_html, page["url"], page["title"])
+                                yield sse("page_cached", {"url": f"/cache/{cid}", "cache_id": cid, "title": page["title"]})
+                            for frame in browser.stream_screenshots(frames=5, delay=0.35):
+                                yield sse("screenshot", {"b64": frame})
+                        except Exception:
+                            pass
                         pages_to_read.append(page)
                         opened += 1
 
@@ -626,6 +974,10 @@ def api_message():
                 return
 
             # SUMMARIZE (stream)
+            if conf.get("dry_run", False):
+                yield sse("status", {"message": "Dry-run mode: skipping summarization."})
+                yield sse("done", {"ok": True, "dry_run": True})
+                return
             yield sse("status", {"message": "Summarizing findings..."})
             yield sse("trace", {"phase": "summarize", "message": "Generating answer from gathered sources"})
             stream = agent.summarize_stream(user_message, pages_to_read)
@@ -633,6 +985,10 @@ def api_message():
             for event in stream:
                 if isinstance(event, dict):
                     et = event.get("event")
+                    if et == "prompt":
+                        if conf.get("dev_show_prompts", False):
+                            yield sse("prompt", event)
+                        continue
                     if et == "meta":
                         yield sse("llm_meta", event.get("meta", {}))
                     elif et == "token":
@@ -655,8 +1011,8 @@ def api_message():
         except Exception as e:
             yield sse("error", {"message": f"Unexpected error: {e}"})
         finally:
-            if browser:
-                browser.quit()
+            # Persistent browser managed by BrowserManager; do not quit here
+            pass
 
     headers = {
         "Content-Type": "text/event-stream",

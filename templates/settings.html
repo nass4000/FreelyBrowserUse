@@ -55,6 +55,28 @@
             <div class="row"><label>Chromedriver path</label><input id="chromedriver_path" placeholder="e.g. bin/chromedriver.exe" /></div>
             <div class="row"><label>Chrome binary path</label><input id="chrome_binary_path" placeholder="optional" /></div>
           </div>
+          <div class="group">
+            <h3>LLM Parameters</h3>
+            <div class="row"><label>Planning temperature</label><input id="planning_temperature" type="number" step="0.05" min="0" max="2" /></div>
+            <div class="row"><label>Planning top_p</label><input id="planning_top_p" type="number" step="0.05" min="0" max="1" /></div>
+            <div class="row"><label>Answer temperature</label><input id="answer_temperature" type="number" step="0.05" min="0" max="2" /></div>
+            <div class="row"><label>Answer top_p</label><input id="answer_top_p" type="number" step="0.05" min="0" max="1" /></div>
+            <div class="row"><label>Answer max_tokens</label><input id="answer_max_tokens" type="number" min="16" max="8192" /></div>
+          </div>
+          <div class="group">
+            <h3>Developer</h3>
+            <div class="row"><label>Developer mode</label><input id="dev_mode" type="checkbox" /></div>
+            <div class="row"><label>Show prompts to LLM</label><input id="dev_show_prompts" type="checkbox" /></div>
+            <div class="row"><label>Show request metadata</label><input id="dev_show_requests" type="checkbox" /></div>
+            <div class="row"><label>Dry-run (skip summarize)</label><input id="dry_run" type="checkbox" /></div>
+            <div class="note">Prompts may include page extracts. Keep this off if sharing screens.</div>
+          </div>
+          <div class="group">
+            <h3>Recording</h3>
+            <div class="row"><label>Use rrweb extension</label><input id="rrweb_use_extension" type="checkbox" /></div>
+            <div class="row"><label>rrweb extension path</label><input id="rrweb_extension_path" placeholder="extensions/rrweb" /></div>
+            <div class="note">Place rrweb.min.js into the extension folder. Headless Chrome may not support extensions on all platforms; disable headless if needed.</div>
+          </div>
           <div class="actions">
             <button class="btn" type="submit">Save</button>
             <span id="status" class="note"></span>
@@ -85,7 +107,10 @@
           'answer_base_url','answer_api_key','answer_model',
           'answer_fallback_base_url','answer_fallback_api_key','answer_model_fallback',
           'browser_headless','browser_pageload_timeout','search_results_per_query','pages_to_open',
-          'chromedriver_path','chrome_binary_path'
+          'chromedriver_path','chrome_binary_path',
+          'planning_temperature','planning_top_p','answer_temperature','answer_top_p','answer_max_tokens',
+          'dev_mode','dev_show_prompts','dev_show_requests','dry_run',
+          'rrweb_use_extension','rrweb_extension_path'
         ];
         ids.forEach(id => {
           const el = document.getElementById(id);

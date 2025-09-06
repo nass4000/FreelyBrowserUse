@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Deep Research Assistant</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
   </head>
   <body>
     <div class="app">
@@ -12,15 +14,34 @@
         <h1>Deep Research Assistant</h1>
         <p class="subtitle">Plan → Act → Summarize with citations</p>
         <div><a href="/settings" style="color:#9bb1c9; font-size:12px;">Settings</a></div>
+        <div class="controls">
+          <span id="browser-status" class="badge">Browser: unknown</span>
+          <button id="btn-start" class="btn-small" type="button">Start Browser</button>
+          <button id="btn-stop" class="btn-small" type="button">Stop Browser</button>
+        </div>
       </header>
 
-      <main>
-        <div id="chat" class="chat"></div>
-
-        <form id="chat-form" class="chat-form">
-          <input id="chat-input" type="text" placeholder="Ask a question..." autocomplete="off" />
-          <button type="submit">Send</button>
-        </form>
+      <main class="layout">
+        <section class="left">
+          <div id="chat" class="chat"></div>
+          <form id="chat-form" class="chat-form">
+            <input id="chat-input" type="text" placeholder="Ask a question..." autocomplete="off" />
+            <button type="submit">Send</button>
+          </form>
+        </section>
+        <aside class="right">
+          <div class="panel">
+            <div class="label">Live Browser Preview</div>
+            <div id="rrweb-player" class="rrweb-container"></div>
+            <div id="screenshot-wrap" class="screenshot-wrap">
+              <img id="page-screenshot" alt="screenshot" />
+            </div>
+            <div class="label" style="margin-top:8px;">HTML Snapshot</div>
+            <div id="page-html" class="page-html"></div>
+            <div class="label" style="margin-top:8px;">Cached Page (iframe)</div>
+            <iframe id="page-iframe" class="page-iframe" sandbox></iframe>
+          </div>
+        </aside>
       </main>
 
       <footer>

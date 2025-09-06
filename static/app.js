@@ -3,10 +3,17 @@
 const chatEl = document.getElementById('chat');
 const formEl = document.getElementById('chat-form');
 const inputEl = document.getElementById('chat-input');
+const startBtn = document.getElementById('btn-start');
+const stopBtn = document.getElementById('btn-stop');
+const browserStatusEl = document.getElementById('browser-status');
 
 let sessionId = null;
 let lastUserMessage = '';
 let streamingController = null;
+let rrwebReplayer = null;
+const screenshotEl = document.getElementById('page-screenshot');
+const pageHtmlEl = document.getElementById('page-html');
+const pageIframe = document.getElementById('page-iframe');
 
 function addUserMessage(text) {
   const m = document.createElement('div');
@@ -50,6 +57,27 @@ function addTimeline(timelineEl, text) {
   it.className = 'timeline-item';
   it.textContent = text;
   timelineEl.appendChild(it);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function addPrompt(timelineEl, payload) {
+  const wrap = document.createElement('div');
+  wrap.className = 'timeline-item prompt-block';
+  const title = document.createElement('div');
+  title.className = 'label';
+  title.textContent = `Prompt (${payload.phase || 'n/a'}) — ${payload.model || ''}`;
+  wrap.appendChild(title);
+  const pre = document.createElement('pre');
+  pre.className = 'prompt-pre';
+  try {
+    const msgs = payload.messages || [];
+    const lines = msgs.map(m => `- ${m.role}: ${m.content}`).join('\n');
+    pre.textContent = lines;
+  } catch (e) {
+    pre.textContent = JSON.stringify(payload, null, 2);
+  }
+  wrap.appendChild(pre);
+  timelineEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
@@ -161,6 +189,7 @@ async function sendMessage(message, clickedUrl = null) {
 
   const { actions, content, timeline } = addAssistantContainer();
   addStatus(actions, 'Starting...');
+  let htmlBuffer = '';
 
   const ctrl = new AbortController();
   streamingController = ctrl;
@@ -207,8 +236,44 @@ async function sendMessage(message, clickedUrl = null) {
             addTimeline(timeline, `Opened: ${data.title || data.url}`);
             break;
           case 'chunk':
-            content.textContent += data.text || '';
+            htmlBuffer += data.text || '';
+            content.innerHTML = sanitizeHTML(htmlBuffer);
             chatEl.scrollTop = chatEl.scrollHeight;
+            break;
+          case 'rrweb':
+            try {
+              const evs = data.events || [];
+              if (!rrwebReplayer && window.rrweb) {
+                const container = document.getElementById('rrweb-player');
+                rrwebReplayer = new rrweb.Replayer([], { root: container, liveMode: true });
+                rrwebReplayer.play();
+              }
+              if (rrwebReplayer) {
+                evs.forEach(e => rrwebReplayer.addEvent(e));
+              }
+            } catch (e) {}
+            break;
+          case 'screenshot':
+            try {
+              if (data.b64) {
+                screenshotEl.src = `data:image/png;base64,${data.b64}`;
+              }
+            } catch (e) {}
+            break;
+          case 'page_html':
+            try {
+              if (data.html && pageHtmlEl) {
+                pageHtmlEl.innerHTML = sanitizeHTML(data.html);
+              }
+            } catch (e) {}
+            break;
+          case 'page_cached':
+            try {
+              if (data.url && pageIframe) {
+                // bust cache
+                pageIframe.src = data.url + '?t=' + Date.now();
+              }
+            } catch (e) {}
             break;
           case 'llm_meta':
             if (data.phase === 'plan') {
@@ -229,6 +294,12 @@ async function sendMessage(message, clickedUrl = null) {
             break;
           case 'trace':
             if (data.message) addTimeline(timeline, data.message);
+            break;
+          case 'prompt':
+            addPrompt(timeline, data);
+            break;
+          case 'thinking':
+            addTimeline(timeline, `Thinking: ${data.text}`);
             break;
           case 'error':
             addStatus(actions, `Error: ${data.message}`);
@@ -253,3 +324,88 @@ formEl.addEventListener('submit', (e) => {
   if (!v) return;
   sendMessage(v);
 });
+
+function sanitizeHTML(input) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(input, 'text/html');
+    const allowed = new Set(['P','BR','UL','OL','LI','A','CODE','PRE','BLOCKQUOTE','H3','H4','H5','EM','STRONG','B','I']);
+    const walker = document.createTreeWalker(doc.body, NodeFilter.SHOW_ELEMENT, null);
+    const toRemove = [];
+    while (walker.nextNode()) {
+      const el = walker.currentNode;
+      const tag = el.tagName;
+      // Remove dangerous tags entirely
+      if (['SCRIPT','STYLE','IFRAME','OBJECT','EMBED','LINK','META'].includes(tag)) {
+        toRemove.push(el);
+        continue;
+      }
+      // Unwrap unknown tags: replace with its children
+      if (!allowed.has(tag)) {
+        const parent = el.parentNode;
+        while (el.firstChild) parent.insertBefore(el.firstChild, el);
+        toRemove.push(el);
+        continue;
+      }
+      // Scrub attributes
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value || '';
+        if (name.startsWith('on')) { el.removeAttribute(attr.name); continue; }
+        if (name === 'style') { el.removeAttribute('style'); continue; }
+        if (tag === 'A' && name === 'href') {
+          // Allow only http/https
+          if (!/^https?:\/\//i.test(value)) { el.removeAttribute('href'); }
+          else {
+            el.setAttribute('target','_blank');
+            el.setAttribute('rel','noopener noreferrer');
+          }
+          continue;
+        }
+        // Drop any other attributes
+        if (!(tag === 'A' && name === 'href')) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    }
+    toRemove.forEach(node => node.remove());
+    return doc.body.innerHTML;
+  } catch (e) {
+    // Fallback: escape
+    const div = document.createElement('div');
+    div.textContent = input;
+    return div.innerHTML;
+  }
+}
+
+async function refreshBrowserStatus() {
+  try {
+    const res = await fetch('/api/browser/status');
+    const j = await res.json();
+    if (j.running) {
+      browserStatusEl.textContent = 'Browser: running';
+      browserStatusEl.style.background = '#16301f';
+      browserStatusEl.style.borderColor = '#335f45';
+    } else {
+      browserStatusEl.textContent = 'Browser: stopped';
+      browserStatusEl.style.background = '#2a1c1c';
+      browserStatusEl.style.borderColor = '#5e2c2c';
+    }
+  } catch (e) {
+    browserStatusEl.textContent = 'Browser: unknown';
+  }
+}
+
+async function startBrowser() {
+  await fetch('/api/browser/start', { method: 'POST' });
+  await refreshBrowserStatus();
+}
+
+async function stopBrowser() {
+  await fetch('/api/browser/stop', { method: 'POST' });
+  await refreshBrowserStatus();
+}
+
+startBtn?.addEventListener('click', startBrowser);
+stopBtn?.addEventListener('click', stopBrowser);
+refreshBrowserStatus();
