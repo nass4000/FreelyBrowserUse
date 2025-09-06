@@ -39,10 +39,12 @@ main { background: var(--panel); border-radius: 12px; padding: 12px; box-shadow:
 .result-item a:hover { text-decoration: underline; }
 .snippet { color: var(--muted); font-size: 12px; }
 
+.timeline-block { background: #0b1119; border: 1px dashed #203046; border-radius: 8px; padding: 8px; margin-bottom: 8px; }
+.timeline-item { color: #c7d4e6; font-size: 12.5px; padding: 2px 0; }
+
 .chat-form { display: flex; gap: 8px; margin-top: 10px; }
 .chat-form input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #223045; background: #0e141c; color: var(--text); }
 .chat-form button { padding: 10px 14px; border-radius: 8px; border: 1px solid #2a3b54; background: #19314c; color: var(--text); cursor: pointer; }
 .chat-form button:hover { background: #234764; }
 
 footer { margin-top: 12px; color: var(--muted); }
-

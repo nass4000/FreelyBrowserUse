@@ -23,11 +23,18 @@ function addAssistantContainer() {
   content.className = 'assistant-content';
   const actions = document.createElement('div');
   actions.className = 'assistant-actions';
+  const timeline = document.createElement('div');
+  timeline.className = 'timeline-block';
+  const th = document.createElement('div');
+  th.className = 'label';
+  th.textContent = 'Timeline';
+  timeline.appendChild(th);
   wrap.appendChild(actions);
+  wrap.appendChild(timeline);
   wrap.appendChild(content);
   chatEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
-  return { wrap, actions, content };
+  return { wrap, actions, content, timeline };
 }
 
 function addStatus(actionsEl, text) {
@@ -35,6 +42,14 @@ function addStatus(actionsEl, text) {
   s.className = 'status';
   s.textContent = text;
   actionsEl.appendChild(s);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function addTimeline(timelineEl, text) {
+  const it = document.createElement('div');
+  it.className = 'timeline-item';
+  it.textContent = text;
+  timelineEl.appendChild(it);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
@@ -54,6 +69,19 @@ function renderPlan(actionsEl, plan) {
       ul.appendChild(li);
     });
     block.appendChild(ul);
+  }
+  if (plan.queries && plan.queries.length) {
+    const qh = document.createElement('div');
+    qh.className = 'label';
+    qh.textContent = 'Search queries';
+    block.appendChild(qh);
+    const ql = document.createElement('ul');
+    plan.queries.forEach(q => {
+      const li = document.createElement('li');
+      li.textContent = q;
+      ql.appendChild(li);
+    });
+    block.appendChild(ql);
   }
   actionsEl.appendChild(block);
 }
@@ -131,7 +159,7 @@ async function sendMessage(message, clickedUrl = null) {
   addUserMessage(message);
   inputEl.value = '';
 
-  const { actions, content } = addAssistantContainer();
+  const { actions, content, timeline } = addAssistantContainer();
   addStatus(actions, 'Starting...');
 
   const ctrl = new AbortController();
@@ -168,19 +196,43 @@ async function sendMessage(message, clickedUrl = null) {
             break;
           case 'plan':
             renderPlan(actions, data);
+            addTimeline(timeline, 'Plan ready');
             break;
           case 'search_results':
             renderSearchResults(actions, data.query, data.results || []);
+            addTimeline(timeline, `Searched: ${data.query}`);
             break;
           case 'read_page':
             addStatus(actions, `Reading: ${data.title || data.url}`);
+            addTimeline(timeline, `Opened: ${data.title || data.url}`);
             break;
           case 'chunk':
             content.textContent += data.text || '';
             chatEl.scrollTop = chatEl.scrollHeight;
             break;
+          case 'llm_meta':
+            if (data.phase === 'plan') {
+              addTimeline(timeline, `Planning model: ${data.model || ''} (${data.base_url || ''})`);
+            } else {
+              addStatus(actions, `Answer model: ${data.model || ''}`);
+              addTimeline(timeline, `Answer model: ${data.model || ''} (${data.base_url || ''})`);
+            }
+            break;
+          case 'usage':
+            try {
+              const u = data.usage || {};
+              const phase = data.phase || 'answer';
+              const txt = `${phase} usage — total: ${u.total_tokens ?? '?'}, prompt: ${u.prompt_tokens ?? '?'}, completion: ${u.completion_tokens ?? '?'}`;
+              addStatus(actions, txt);
+              addTimeline(timeline, txt);
+            } catch {}
+            break;
+          case 'trace':
+            if (data.message) addTimeline(timeline, data.message);
+            break;
           case 'error':
             addStatus(actions, `Error: ${data.message}`);
+            addTimeline(timeline, `Error: ${data.message}`);
             break;
           case 'done':
             addStatus(actions, 'Done');
@@ -201,4 +253,3 @@ formEl.addEventListener('submit', (e) => {
   if (!v) return;
   sendMessage(v);
 });
-

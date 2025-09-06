@@ -4,6 +4,7 @@ import time
 import uuid
 import queue
 import threading
+import re
 from typing import Dict, List, Generator, Optional
 
 from flask import Flask, Response, jsonify, render_template, request
@@ -23,20 +24,59 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 
 
 # -----------------------------
-# Config / Environment
+# Config: environment + file override + API
 # -----------------------------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
 
-# Default models; override via env vars
-PLANNING_MODEL = os.getenv("OPENROUTER_PLANNING_MODEL", "google/gemini-2.5-flash")
-ANSWER_MODEL = os.getenv("OPENROUTER_ANSWER_MODEL", "deepseek/deepseek-chat-v3.1")
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v not in ("0", "false", "False", "")
 
-# Browser settings
-HEADLESS = os.getenv("BROWSER_HEADLESS", "1") not in ("0", "false", "False")
-BROWSER_PAGELOAD_TIMEOUT = int(os.getenv("BROWSER_PAGELOAD_TIMEOUT", "25"))
-SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "5"))
-PAGES_TO_OPEN = int(os.getenv("PAGES_TO_OPEN", "3"))
+def load_config() -> Dict:
+    base = {
+        # Shared defaults
+        "openrouter_api_key": os.getenv("OPENROUTER_API_KEY", ""),
+        "openrouter_base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        # Planning
+        "planning_model": os.getenv("OPENROUTER_PLANNING_MODEL", "google/gemini-2.5-flash"),
+        "planning_base_url": os.getenv("PLANNING_BASE_URL", os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")),
+        "planning_api_key": os.getenv("PLANNING_API_KEY", os.getenv("OPENROUTER_API_KEY", "")),
+        # Answer
+        "answer_model": os.getenv("OPENROUTER_ANSWER_MODEL", "deepseek/deepseek-reasoner"),
+        "answer_base_url": os.getenv("ANSWER_BASE_URL", os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")),
+        "answer_api_key": os.getenv("ANSWER_API_KEY", os.getenv("OPENROUTER_API_KEY", "")),
+        # Fallback
+        "answer_model_fallback": os.getenv("OPENROUTER_ANSWER_MODEL_FALLBACK", "google/gemini-2.5-flash"),
+        "answer_fallback_base_url": os.getenv("ANSWER_FALLBACK_BASE_URL", os.getenv("ANSWER_BASE_URL", os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))),
+        "answer_fallback_api_key": os.getenv("ANSWER_FALLBACK_API_KEY", os.getenv("ANSWER_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))),
+        # Browser
+        "browser_headless": _env_bool("BROWSER_HEADLESS", True),
+        "browser_pageload_timeout": int(os.getenv("BROWSER_PAGELOAD_TIMEOUT", "25")),
+        "search_results_per_query": int(os.getenv("SEARCH_RESULTS_PER_QUERY", "5")),
+        "pages_to_open": int(os.getenv("PAGES_TO_OPEN", "10")),
+    }
+    # Overlay with config file if present
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                file_conf = json.load(f)
+                base.update({k: v for k, v in file_conf.items() if v is not None})
+    except Exception:
+        pass
+    return base
+
+
+def save_config(conf: Dict):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(conf, f, indent=2)
+    except Exception:
+        pass
+
+
+CONFIG = load_config()
 
 
 # -----------------------------
@@ -89,38 +129,68 @@ def allowed_url(url: str) -> bool:
     return not any(b in url for b in blocked)
 
 
+def normalize_url(url: str) -> str:
+    try:
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+        p = urlparse(url)
+        params = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=False)
+                  if not k.lower().startswith("utm_") and k.lower() not in ("gclid", "fbclid")]
+        clean = p._replace(query=urlencode(params), fragment="")
+        u = urlunparse(clean)
+        if u.endswith('/'):
+            u = u[:-1]
+        return u
+    except Exception:
+        return url
+
+
 # -----------------------------
 # OpenRouter Client
 # -----------------------------
 class OpenRouterClient:
-    def __init__(self, api_key: str, base_url: str = OPENROUTER_BASE_URL):
+    def __init__(self, api_key: str, base_url: str = "https://openrouter.ai/api/v1", fallback: Optional[Dict] = None):
         if not api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is required.")
+            raise RuntimeError("API key is required.")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.fallback = fallback or {}
 
-    def chat(self, messages: List[Dict], model: str, stream: bool = False) -> requests.Response:
-        url = f"{self.base_url}/chat/completions"
+    def _post_chat(self, api_key: str, base_url: str, messages: List[Dict], model: str, stream: bool) -> requests.Response:
+        url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            # Optional routing headers:
             "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:5000"),
             "X-Title": os.getenv("OPENROUTER_APP_NAME", "Research Assistant"),
         }
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-            "stream": stream,
-        }
+        payload = {"model": model, "messages": messages, "temperature": 0.2, "stream": stream}
         resp = requests.post(url, headers=headers, json=payload, stream=stream, timeout=60)
         resp.raise_for_status()
         return resp
 
-    def stream_chat_text(self, messages: List[Dict], model: str) -> Generator[str, None, None]:
+    def chat(self, messages: List[Dict], model: str, stream: bool = False) -> requests.Response:
+        return self._post_chat(self.api_key, self.base_url, messages, model, stream)
+
+    def stream_chat_text(self, messages: List[Dict], model: str) -> Generator[dict, None, None]:
+        """Yield dict events: {event: 'meta'|'token'|'usage'|'error', ...}"""
+        def emit_error(msg: str):
+            yield {"event": "error", "message": msg}
+
         try:
             resp = self.chat(messages, model=model, stream=True)
+            meta = {
+                "model": model,
+                "base_url": self.base_url,
+                "rate_limit": {
+                    k: resp.headers.get(k)
+                    for k in ("X-RateLimit-Remaining", "X-RateLimit-Limit", "X-RateLimit-Reset")
+                    if resp.headers.get(k) is not None
+                },
+            }
+            yield {"event": "meta", "meta": meta}
+
+            last_usage = None
             for line in resp.iter_lines(decode_unicode=True):
                 if not line:
                     continue
@@ -130,34 +200,63 @@ class OpenRouterClient:
                         break
                     try:
                         obj = json.loads(data)
+                        if "usage" in obj:
+                            last_usage = obj["usage"]
                         delta = obj.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content")
                         if content:
-                            yield content
+                            yield {"event": "token", "text": content}
                     except Exception:
-                        # Ignore malformed stream chunks
                         continue
+            if last_usage:
+                yield {"event": "usage", "usage": last_usage, "model": model}
+        except requests.HTTPError as he:
+            try:
+                body = he.response.text[:400]
+            except Exception:
+                body = str(he)
+            yield from emit_error(f"LLM HTTP error: {he} | {body}")
+            yield from self._fallback_chat(messages, model)
         except Exception as e:
-            # Fall back to non-streaming single completion
+            yield from emit_error(f"LLM error: {e}")
             yield from self._fallback_chat(messages, model)
 
-    def _fallback_chat(self, messages: List[Dict], model: str) -> Generator[str, None, None]:
-        try:
-            resp = self.chat(messages, model=model, stream=False)
+    def _fallback_chat(self, messages: List[Dict], model: str) -> Generator[dict, None, None]:
+        def nonstream_once(m: str, api_key: str, base_url: str):
+            resp = self._post_chat(api_key, base_url, messages, m, stream=False)
             obj = resp.json()
             content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-            # Stream as a single chunk to the client
+            usage = obj.get("usage")
             if content:
-                yield content
-        except Exception as e:
-            yield f"\n[LLM error: {e}]\n"
+                yield {"event": "token", "text": content}
+            if usage:
+                yield {"event": "usage", "usage": usage, "model": m}
+
+        try:
+            yield from nonstream_once(model, self.api_key, self.base_url)
+        except Exception:
+            fb = self.fallback.get("model") or model
+            fb_key = self.fallback.get("api_key") or self.api_key
+            fb_base = self.fallback.get("base_url") or self.base_url
+            if fb != model:
+                try:
+                    yield {"event": "meta", "meta": {"model_fallback": fb, "base_url": fb_base}}
+                    yield from nonstream_once(fb, fb_key, fb_base)
+                    return
+                except Exception as e2:
+                    yield {"event": "error", "message": f"Fallback model failed: {e2}"}
+            yield {"event": "error", "message": "All LLM calls failed."}
 
 
 # -----------------------------
 # Headless Browser Wrapper (undetected_chromedriver + Selenium)
 # -----------------------------
 class Browser:
-    def __init__(self, headless: bool = HEADLESS):
+    def __init__(self, headless: bool = True, pageload_timeout: int = 25):
+        self.driver = self._init_driver(headless)
+        self.driver.set_page_load_timeout(pageload_timeout)
+
+    def _build_options(self, headless: bool):
         options = uc.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
@@ -167,8 +266,39 @@ class Browser:
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1280,800")
         options.add_argument("--incognito")
-        self.driver = uc.Chrome(options=options)
-        self.driver.set_page_load_timeout(BROWSER_PAGELOAD_TIMEOUT)
+        return options
+
+    def _init_driver(self, headless: bool):
+        options = self._build_options(headless)
+        # Allow manual pin via env var (e.g., 139, 140)
+        env_version = os.getenv("UC_CHROME_VERSION_MAIN")
+        try:
+            if env_version:
+                return uc.Chrome(options=options, version_main=int(env_version))
+            return uc.Chrome(options=options)
+        except Exception as e:
+            # Attempt to parse installed Chrome major version from error and retry
+            msg = str(e)
+            m = re.search(r"Current browser version is (\d+)", msg)
+            if m:
+                major = int(m.group(1))
+                try:
+                    return uc.Chrome(options=options, version_main=major)
+                except Exception:
+                    pass
+            # As a last attempt, if headless, try non-headless in case of platform headless issues
+            if headless:
+                try:
+                    options2 = self._build_options(False)
+                    if env_version:
+                        return uc.Chrome(options=options2, version_main=int(env_version))
+                    if m:
+                        return uc.Chrome(options=options2, version_main=int(m.group(1)))
+                    return uc.Chrome(options=options2)
+                except Exception:
+                    pass
+            # Re-raise original exception if all retries fail
+            raise
 
     def quit(self):
         try:
@@ -203,7 +333,10 @@ class Browser:
                 title = a.text.strip() or (a.get_attribute("title") or "").strip()
                 if not href or not allowed_url(href):
                     continue
-                results.append({"title": title or href, "url": href, "snippet": ""})
+                clean = normalize_url(href)
+                if any(r.get("url") == clean for r in results):
+                    continue
+                results.append({"title": title or clean, "url": clean, "snippet": ""})
                 if len(results) >= max_results:
                     break
         except TimeoutException:
@@ -216,6 +349,7 @@ class Browser:
         if not allowed_url(url):
             return None
         try:
+            url = normalize_url(url)
             self.driver.get(url)
             self._wait_ready(timeout)
             time.sleep(1.2)  # allow dynamic content to settle
@@ -234,8 +368,11 @@ class Browser:
 # Agent logic (Plan -> Act -> Summarize)
 # -----------------------------
 class ResearchAgent:
-    def __init__(self, llm: OpenRouterClient):
-        self.llm = llm
+    def __init__(self, planning_llm: OpenRouterClient, answer_llm: OpenRouterClient, planning_model: str, answer_model: str):
+        self.planning_llm = planning_llm
+        self.answer_llm = answer_llm
+        self.planning_model = planning_model
+        self.answer_model = answer_model
 
     def make_plan(self, question: str) -> Dict:
         sys_prompt = (
@@ -250,7 +387,7 @@ class ResearchAgent:
         ]
         # Non-streaming small call for planning
         try:
-            resp = self.llm.chat(messages, model=PLANNING_MODEL, stream=False)
+            resp = self.planning_llm.chat(messages, model=self.planning_model, stream=False)
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
             plan = json.loads(self._extract_json(content))
@@ -258,14 +395,15 @@ class ResearchAgent:
             steps = plan.get("steps") or []
             if not isinstance(queries, list) or not queries:
                 queries = [question]
-            return {"queries": [sanitize_query(q) for q in queries][:4], "steps": steps[:6]}
+            usage = data.get("usage")
+            return {"queries": [sanitize_query(q) for q in queries][:4], "steps": steps[:6]}, usage
         except Exception:
             # Fallback plan
             base = sanitize_query(question)
             return {
                 "queries": [base, f"site:.gov {base}", f"site:.edu {base}"],
                 "steps": ["Search the web", "Open top sources", "Cross-verify facts", "Summarize with citations"],
-            }
+            }, None
 
     def _extract_json(self, content: str) -> str:
         # Try to extract a JSON object from text
@@ -300,7 +438,7 @@ class ResearchAgent:
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_msg},
         ]
-        return self.llm.stream_chat_text(messages, model=ANSWER_MODEL)
+        return self.answer_llm.stream_chat_text(messages, model=self.answer_model)
 
 
 # -----------------------------
@@ -309,6 +447,27 @@ class ResearchAgent:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+@app.route("/settings")
+def settings_page():
+    return render_template("settings.html")
+
+@app.get("/api/settings")
+def get_settings():
+    # Do not mask here since it's a local panel; mask if needed
+    return jsonify(CONFIG)
+
+@app.post("/api/settings")
+def post_settings():
+    data = request.get_json(force=True, silent=True) or {}
+    allowed_keys = set(CONFIG.keys())
+    for k, v in list(data.items()):
+        if k not in allowed_keys:
+            data.pop(k)
+    # Merge and persist
+    CONFIG.update(data)
+    save_config(CONFIG)
+    return jsonify({"ok": True, "config": CONFIG})
 
 
 @app.post("/api/message")
@@ -336,26 +495,42 @@ def api_message():
 
         # Init clients
         try:
-            llm = OpenRouterClient(OPENROUTER_API_KEY)
+            conf = CONFIG
+            planning_llm = OpenRouterClient(api_key=conf["planning_api_key"], base_url=conf["planning_base_url"])
+            answer_llm = OpenRouterClient(
+                api_key=conf["answer_api_key"],
+                base_url=conf["answer_base_url"],
+                fallback={
+                    "model": conf.get("answer_model_fallback"),
+                    "api_key": conf.get("answer_fallback_api_key") or conf.get("answer_api_key"),
+                    "base_url": conf.get("answer_fallback_base_url") or conf.get("answer_base_url"),
+                },
+            )
         except Exception as e:
             yield sse("error", {"message": f"LLM init failed: {e}"})
             return
-
-        agent = ResearchAgent(llm)
+        
+        agent = ResearchAgent(planning_llm, answer_llm, planning_model=conf["planning_model"], answer_model=conf["answer_model"])
         browser = None
         try:
             # PLAN
             yield sse("status", {"message": "Planning research steps..."})
-            plan = agent.make_plan(user_message)
+            plan, plan_usage = agent.make_plan(user_message)
             sess.plan = plan
+            # Planning meta and usage events
+            yield sse("llm_meta", {"phase": "plan", "model": conf["planning_model"], "base_url": conf["planning_base_url"]})
+            if plan_usage:
+                yield sse("usage", {"phase": "plan", "usage": plan_usage, "model": conf["planning_model"]})
             yield sse("plan", plan)
+            yield sse("trace", {"phase": "plan", "message": "Plan created", "steps": plan.get("steps", [])})
 
             # ACT
-            browser = Browser(headless=HEADLESS)
+            browser = Browser(headless=conf.get("browser_headless", True), pageload_timeout=conf.get("browser_pageload_timeout", 25))
             collected_results: List[Dict] = []
+            yield sse("trace", {"phase": "act", "message": "Executing search queries", "queries": plan["queries"]})
             for q in plan["queries"][:4]:
                 yield sse("status", {"message": f"Searching for: {q}"})
-                results = browser.search(q, max_results=SEARCH_RESULTS_PER_QUERY)
+                results = browser.search(q, max_results=conf.get("search_results_per_query", 5))
                 yield sse("search_results", {"query": q, "results": results})
                 collected_results.extend(results)
 
@@ -370,10 +545,10 @@ def api_message():
                     pages_to_read.append(page)
 
             # Auto-open top results if we still need context
-            if len(pages_to_read) < PAGES_TO_OPEN:
+            if len(pages_to_read) < conf.get("pages_to_open", 10):
                 opened = 0
                 for r in collected_results:
-                    if opened >= (PAGES_TO_OPEN - len(pages_to_read)):
+                    if opened >= (conf.get("pages_to_open", 10) - len(pages_to_read)):
                         break
                     url = r.get("url")
                     if not url or url in sess.scraped_pages:
@@ -387,7 +562,7 @@ def api_message():
 
             if not pages_to_read:
                 # Fallback to any previously scraped pages for the session
-                pages_to_read = list(sess.scraped_pages.values())[: PAGES_TO_OPEN]
+                pages_to_read = list(sess.scraped_pages.values())[: conf.get("pages_to_open", 10)]
 
             if not pages_to_read:
                 yield sse("error", {"message": "No relevant pages could be opened."})
@@ -395,11 +570,27 @@ def api_message():
 
             # SUMMARIZE (stream)
             yield sse("status", {"message": "Summarizing findings..."})
+            yield sse("trace", {"phase": "summarize", "message": "Generating answer from gathered sources"})
             stream = agent.summarize_stream(user_message, pages_to_read)
             full_text = []
-            for token in stream:
-                full_text.append(token)
-                yield sse("chunk", {"text": token})
+            for event in stream:
+                if isinstance(event, dict):
+                    et = event.get("event")
+                    if et == "meta":
+                        yield sse("llm_meta", event.get("meta", {}))
+                    elif et == "token":
+                        tok = event.get("text", "")
+                        full_text.append(tok)
+                        yield sse("chunk", {"text": tok})
+                    elif et == "usage":
+                        usage = event.get("usage", {})
+                        model_used = event.get("model")
+                        yield sse("usage", {"phase": "answer", "usage": usage, "model": model_used})
+                    elif et == "error":
+                        yield sse("error", {"message": event.get("message", "LLM error")})
+                else:
+                    full_text.append(str(event))
+                    yield sse("chunk", {"text": str(event)})
 
             final = "".join(full_text)
             sess.messages.append({"role": "assistant", "content": final})
@@ -421,4 +612,3 @@ def api_message():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
-

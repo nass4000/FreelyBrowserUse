@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Settings — Deep Research Assistant</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <style>
+      .settings { background:#121821; border-radius:12px; padding:12px; }
+      .group { border:1px solid #1b2735; padding:10px; border-radius:8px; margin-bottom:10px; }
+      .group h3 { margin:0 0 8px; font-size:14px; color:#4aa3ff; }
+      .row { display:flex; gap:8px; margin:6px 0; align-items:center; }
+      .row label { width:220px; color:#9bb1c9; font-size:13px; }
+      .row input { flex:1; padding:8px; border-radius:6px; border:1px solid #223045; background:#0e141c; color:#e6eef8; }
+      .row input[type="checkbox"] { width:auto; }
+      .actions { display:flex; gap:8px; }
+      .btn { padding:8px 12px; border:1px solid #2a3b54; background:#19314c; color:#e6eef8; border-radius:8px; cursor:pointer; }
+      .btn:hover { background:#234764; }
+      .note { color:#9bb1c9; font-size:12px; }
+      a { color:#4ccd7a; text-decoration:none; }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>Settings</h1>
+        <p class="subtitle"><a href="/">← Back to chat</a></p>
+      </header>
+      <main class="settings">
+        <form id="settings-form">
+          <div class="group">
+            <h3>Planning</h3>
+            <div class="row"><label>Base URL</label><input id="planning_base_url" /></div>
+            <div class="row"><label>API Key</label><input id="planning_api_key" /></div>
+            <div class="row"><label>Model</label><input id="planning_model" /></div>
+          </div>
+          <div class="group">
+            <h3>Answer</h3>
+            <div class="row"><label>Base URL</label><input id="answer_base_url" /></div>
+            <div class="row"><label>API Key</label><input id="answer_api_key" /></div>
+            <div class="row"><label>Model</label><input id="answer_model" /></div>
+          </div>
+          <div class="group">
+            <h3>Answer Fallback</h3>
+            <div class="row"><label>Fallback Base URL</label><input id="answer_fallback_base_url" /></div>
+            <div class="row"><label>Fallback API Key</label><input id="answer_fallback_api_key" /></div>
+            <div class="row"><label>Fallback Model</label><input id="answer_model_fallback" /></div>
+          </div>
+          <div class="group">
+            <h3>Browser & Search</h3>
+            <div class="row"><label>Headless</label><input id="browser_headless" type="checkbox" /></div>
+            <div class="row"><label>Page load timeout (s)</label><input id="browser_pageload_timeout" type="number" /></div>
+            <div class="row"><label>Search results per query</label><input id="search_results_per_query" type="number" /></div>
+            <div class="row"><label>Pages to open</label><input id="pages_to_open" type="number" /></div>
+          </div>
+          <div class="actions">
+            <button class="btn" type="submit">Save</button>
+            <span id="status" class="note"></span>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <script>
+      async function loadSettings() {
+        const res = await fetch('/api/settings');
+        const conf = await res.json();
+        for (const k of Object.keys(conf)) {
+          const el = document.getElementById(k);
+          if (!el) continue;
+          if (el.type === 'checkbox') {
+            el.checked = !!conf[k];
+          } else {
+            el.value = conf[k] ?? '';
+          }
+        }
+      }
+      async function saveSettings(e) {
+        e.preventDefault();
+        const data = {};
+        const ids = [
+          'planning_base_url','planning_api_key','planning_model',
+          'answer_base_url','answer_api_key','answer_model',
+          'answer_fallback_base_url','answer_fallback_api_key','answer_model_fallback',
+          'browser_headless','browser_pageload_timeout','search_results_per_query','pages_to_open'
+        ];
+        ids.forEach(id => {
+          const el = document.getElementById(id);
+          if (!el) return;
+          if (el.type === 'checkbox') data[id] = el.checked;
+          else if (el.type === 'number') data[id] = Number(el.value);
+          else data[id] = el.value;
+        });
+        const res = await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+        const out = await res.json();
+        document.getElementById('status').textContent = out.ok ? 'Saved' : (out.error || 'Failed');
+      }
+      document.getElementById('settings-form').addEventListener('submit', saveSettings);
+      loadSettings();
+    </script>
+  </body>
+  </html>
+
