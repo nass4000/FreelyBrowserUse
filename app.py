@@ -56,6 +56,9 @@ def load_config() -> Dict:
         "browser_pageload_timeout": int(os.getenv("BROWSER_PAGELOAD_TIMEOUT", "25")),
         "search_results_per_query": int(os.getenv("SEARCH_RESULTS_PER_QUERY", "5")),
         "pages_to_open": int(os.getenv("PAGES_TO_OPEN", "10")),
+        # Binaries
+        "chromedriver_path": os.getenv("CHROMEDRIVER_PATH", ""),
+        "chrome_binary_path": os.getenv("CHROME_BINARY_PATH", ""),
     }
     # Overlay with config file if present
     try:
@@ -156,6 +159,15 @@ class OpenRouterClient:
         self.base_url = base_url.rstrip("/")
         self.fallback = fallback or {}
 
+    def _resolve_model(self, base_url: str, model: str) -> str:
+        b = (base_url or "").lower()
+        m = model
+        # DeepSeek native API expects model ids like 'deepseek-chat' or 'deepseek-reasoner'.
+        if "deepseek.com" in b:
+            if "/" in m:
+                m = m.split("/")[-1]
+        return m
+
     def _post_chat(self, api_key: str, base_url: str, messages: List[Dict], model: str, stream: bool) -> requests.Response:
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -164,7 +176,8 @@ class OpenRouterClient:
             "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:5000"),
             "X-Title": os.getenv("OPENROUTER_APP_NAME", "Research Assistant"),
         }
-        payload = {"model": model, "messages": messages, "temperature": 0.2, "stream": stream}
+        resolved_model = self._resolve_model(base_url, model)
+        payload = {"model": resolved_model, "messages": messages, "temperature": 0.2, "stream": stream}
         resp = requests.post(url, headers=headers, json=payload, stream=stream, timeout=60)
         resp.raise_for_status()
         return resp
@@ -215,7 +228,11 @@ class OpenRouterClient:
                 body = he.response.text[:400]
             except Exception:
                 body = str(he)
-            yield from emit_error(f"LLM HTTP error: {he} | {body}")
+            # Add a hint for common provider/model mismatches
+            hint = ""
+            if "Model Not Exist" in body or "invalid_request_error" in body:
+                hint = " Tip: check that your base URL matches the model vendor (e.g., deepseek.com with 'deepseek-chat' or use openrouter.ai with 'deepseek/deepseek-reasoner')."
+            yield from emit_error(f"LLM HTTP error: {he} | {body}{hint}")
             yield from self._fallback_chat(messages, model)
         except Exception as e:
             yield from emit_error(f"LLM error: {e}")
@@ -252,11 +269,11 @@ class OpenRouterClient:
 # Headless Browser Wrapper (undetected_chromedriver + Selenium)
 # -----------------------------
 class Browser:
-    def __init__(self, headless: bool = True, pageload_timeout: int = 25):
-        self.driver = self._init_driver(headless)
+    def __init__(self, headless: bool = True, pageload_timeout: int = 25, driver_path: Optional[str] = None, binary_path: Optional[str] = None):
+        self.driver = self._init_driver(headless, driver_path=driver_path, binary_path=binary_path)
         self.driver.set_page_load_timeout(pageload_timeout)
 
-    def _build_options(self, headless: bool):
+    def _build_options(self, headless: bool, binary_path: Optional[str] = None):
         options = uc.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
@@ -266,16 +283,48 @@ class Browser:
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1280,800")
         options.add_argument("--incognito")
+        if binary_path:
+            try:
+                options.binary_location = binary_path
+            except Exception:
+                pass
         return options
 
-    def _init_driver(self, headless: bool):
-        options = self._build_options(headless)
+    def _init_driver(self, headless: bool, driver_path: Optional[str] = None, binary_path: Optional[str] = None):
         # Allow manual pin via env var (e.g., 139, 140)
         env_version = os.getenv("UC_CHROME_VERSION_MAIN")
+
+        # If a specific chromedriver path is provided or bundled, try that first
+        candidate_paths = []
+        if driver_path:
+            candidate_paths.append(driver_path)
+        # Look for bundled driver in bin/
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            win_path = os.path.join(base_dir, "bin", "chromedriver.exe")
+            nix_path = os.path.join(base_dir, "bin", "chromedriver")
+            if os.path.exists(win_path):
+                candidate_paths.append(win_path)
+            if os.path.exists(nix_path):
+                candidate_paths.append(nix_path)
+        except Exception:
+            pass
+
+        # Try provided/bundled driver paths with fresh options each attempt
+        for p in candidate_paths:
+            try:
+                opts = self._build_options(headless, binary_path=binary_path)
+                return uc.Chrome(options=opts, driver_executable_path=p)
+            except Exception:
+                continue
+
+        # Try by version_main (from env), then default — with fresh options each time
         try:
             if env_version:
-                return uc.Chrome(options=options, version_main=int(env_version))
-            return uc.Chrome(options=options)
+                opts_env = self._build_options(headless, binary_path=binary_path)
+                return uc.Chrome(options=opts_env, version_main=int(env_version))
+            opts_def = self._build_options(headless, binary_path=binary_path)
+            return uc.Chrome(options=opts_def)
         except Exception as e:
             # Attempt to parse installed Chrome major version from error and retry
             msg = str(e)
@@ -283,18 +332,21 @@ class Browser:
             if m:
                 major = int(m.group(1))
                 try:
-                    return uc.Chrome(options=options, version_main=major)
+                    opts_maj = self._build_options(headless, binary_path=binary_path)
+                    return uc.Chrome(options=opts_maj, version_main=major)
                 except Exception:
                     pass
-            # As a last attempt, if headless, try non-headless in case of platform headless issues
+            # As a last attempt, if headless, try non-headless with fresh options each call
             if headless:
                 try:
-                    options2 = self._build_options(False)
                     if env_version:
-                        return uc.Chrome(options=options2, version_main=int(env_version))
+                        opts_nh_env = self._build_options(False, binary_path=binary_path)
+                        return uc.Chrome(options=opts_nh_env, version_main=int(env_version))
                     if m:
-                        return uc.Chrome(options=options2, version_main=int(m.group(1)))
-                    return uc.Chrome(options=options2)
+                        opts_nh_maj = self._build_options(False, binary_path=binary_path)
+                        return uc.Chrome(options=opts_nh_maj, version_main=int(m.group(1)))
+                    opts_nh = self._build_options(False, binary_path=binary_path)
+                    return uc.Chrome(options=opts_nh)
                 except Exception:
                     pass
             # Re-raise original exception if all retries fail
@@ -525,7 +577,12 @@ def api_message():
             yield sse("trace", {"phase": "plan", "message": "Plan created", "steps": plan.get("steps", [])})
 
             # ACT
-            browser = Browser(headless=conf.get("browser_headless", True), pageload_timeout=conf.get("browser_pageload_timeout", 25))
+            browser = Browser(
+                headless=conf.get("browser_headless", True),
+                pageload_timeout=conf.get("browser_pageload_timeout", 25),
+                driver_path=conf.get("chromedriver_path") or os.getenv("CHROMEDRIVER_PATH"),
+                binary_path=conf.get("chrome_binary_path") or os.getenv("CHROME_BINARY_PATH"),
+            )
             collected_results: List[Dict] = []
             yield sse("trace", {"phase": "act", "message": "Executing search queries", "queries": plan["queries"]})
             for q in plan["queries"][:4]:

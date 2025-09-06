@@ -52,6 +52,8 @@
             <div class="row"><label>Page load timeout (s)</label><input id="browser_pageload_timeout" type="number" /></div>
             <div class="row"><label>Search results per query</label><input id="search_results_per_query" type="number" /></div>
             <div class="row"><label>Pages to open</label><input id="pages_to_open" type="number" /></div>
+            <div class="row"><label>Chromedriver path</label><input id="chromedriver_path" placeholder="e.g. bin/chromedriver.exe" /></div>
+            <div class="row"><label>Chrome binary path</label><input id="chrome_binary_path" placeholder="optional" /></div>
           </div>
           <div class="actions">
             <button class="btn" type="submit">Save</button>
@@ -82,7 +84,8 @@
           'planning_base_url','planning_api_key','planning_model',
           'answer_base_url','answer_api_key','answer_model',
           'answer_fallback_base_url','answer_fallback_api_key','answer_model_fallback',
-          'browser_headless','browser_pageload_timeout','search_results_per_query','pages_to_open'
+          'browser_headless','browser_pageload_timeout','search_results_per_query','pages_to_open',
+          'chromedriver_path','chrome_binary_path'
         ];
         ids.forEach(id => {
           const el = document.getElementById(id);
@@ -100,4 +103,3 @@
     </script>
   </body>
   </html>
-
