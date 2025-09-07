@@ -7,6 +7,7 @@ const startBtn = document.getElementById('btn-start');
 const restartBtn = document.getElementById('btn-restart');
 const stopBtn = document.getElementById('btn-stop');
 const browserStatusEl = document.getElementById('browser-status');
+const screenshotWrapEl = document.getElementById('screenshot-wrap');
 
 let sessionId = null;
 let lastUserMessage = '';
@@ -15,6 +16,32 @@ const screenshotEl = document.getElementById('page-screenshot');
 let livePreviewTimer = null;
 let lastStreamAt = 0;
 let statusTimer = null;
+
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn.apply(null, args), ms);
+  };
+}
+
+async function resizeWebDriverToCanvas() {
+  try {
+    if (!screenshotWrapEl) return;
+    const rect = screenshotWrapEl.getBoundingClientRect();
+    const cssW = Math.max(400, Math.floor(rect.width));
+    const cssH = Math.max(300, Math.floor(rect.height));
+    const scale = Math.min(2.0, Math.max(1.0, window.devicePixelRatio || 1));
+    const targetW = Math.round(cssW * scale);
+    const targetH = Math.round(cssH * scale);
+    await fetch('/api/browser/resize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ width: targetW, height: targetH, dpr: scale })
+    });
+  } catch (e) { /* ignore */ }
+}
+const debouncedResizeDriver = debounce(resizeWebDriverToCanvas, 400);
 
 function addUserMessage(text) {
   const m = document.createElement('div');
@@ -387,6 +414,7 @@ async function refreshBrowserStatus() {
 
 async function startBrowser() {
   try {
+    await resizeWebDriverToCanvas();
     // fire-and-forget; don't block UI on slow driver init
     fetch('/api/browser/start', { method: 'POST' });
   } catch (e) {}
@@ -395,6 +423,7 @@ async function startBrowser() {
 
 async function restartBrowser() {
   try {
+    await resizeWebDriverToCanvas();
     // non-blocking restart: triggers async start on server
     fetch('/api/browser/restart', { method: 'POST' });
     // hint immediately in UI; polling will take over
@@ -416,6 +445,7 @@ function startLivePreview() {
     // If recently updated by streaming, skip this poll
     if (Date.now() - lastStreamAt < 500) return;
     try {
+      debouncedResizeDriver();
       const r = await fetch('/api/browser/capture');
       const j = await r.json();
       if (j && j.ok && j.b64) {
@@ -443,3 +473,4 @@ function startStatusPolling() {
 
 refreshBrowserStatus();
 startStatusPolling();
+window.addEventListener('resize', debouncedResizeDriver);

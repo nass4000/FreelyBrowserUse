@@ -35,6 +35,22 @@
             <div class="row"><label>Model</label><input id="planning_model" /></div>
           </div>
           <div class="group">
+            <h3>Preview & YOLO</h3>
+            <div class="row"><label>Enable pan (scrolling)</label><input id="preview_enable_pan" type="checkbox" /></div>
+            <div class="row"><label>Frames per preview</label><input id="preview_frames" type="number" min="1" max="60" /></div>
+            <div class="row"><label>Delay between frames (s)</label><input id="preview_delay" type="number" step="0.01" min="0.01" max="2" /></div>
+            <div class="row"><label>Enable YOLO overlay</label><input id="preview_yolo_enable" type="checkbox" /></div>
+            <div class="row"><label>YOLO model</label><input id="preview_yolo_model" placeholder="yolov8n.pt" /></div>
+            <div class="row"><label>YOLO confidence</label><input id="preview_yolo_conf" type="number" step="0.05" min="0" max="1" /></div>
+            <div class="row"><label>Rich info panel</label><input id="preview_yolo_rich_panel" type="checkbox" /></div>
+            <div class="row"><label>Thumbnails (top-K)</label><input id="preview_yolo_topk" type="number" min="1" max="8" /></div>
+            <div class="row">
+              <button class="btn" type="button" id="btn-yolo-ensure">Ensure/Download model</button>
+              <span id="yolo-status" class="note"></span>
+            </div>
+            <div class="note">YOLO requires installing dependencies (ultralytics, torch). Running on CPU may be slow.</div>
+          </div>
+          <div class="group">
             <h3>Answer</h3>
             <div class="row"><label>Base URL</label><input id="answer_base_url" /></div>
             <div class="row"><label>API Key</label><input id="answer_api_key" /></div>
@@ -104,7 +120,9 @@
           'browser_headless','browser_pageload_timeout','search_results_per_query','pages_to_open',
           'chromedriver_path','chrome_binary_path',
           'planning_temperature','planning_top_p','answer_temperature','answer_top_p','answer_max_tokens',
-          'dev_mode','dev_show_prompts','dev_show_requests','dry_run'
+          'dev_mode','dev_show_prompts','dev_show_requests','dry_run',
+          'preview_enable_pan','preview_frames','preview_delay',
+          'preview_yolo_enable','preview_yolo_model','preview_yolo_conf','preview_yolo_rich_panel','preview_yolo_topk'
         ];
         ids.forEach(id => {
           const el = document.getElementById(id);
@@ -118,6 +136,17 @@
         document.getElementById('status').textContent = out.ok ? 'Saved' : (out.error || 'Failed');
       }
       document.getElementById('settings-form').addEventListener('submit', saveSettings);
+      document.getElementById('btn-yolo-ensure').addEventListener('click', async () => {
+        const s = document.getElementById('yolo-status');
+        s.textContent = 'Ensuring model...';
+        try {
+          const res = await fetch('/api/yolo/ensure', { method: 'POST' });
+          const j = await res.json();
+          if (j.ok) s.textContent = `Model ready${j.local_path ? ' @ ' + j.local_path : ''}`; else s.textContent = j.error || 'Failed';
+        } catch (e) {
+          s.textContent = String(e);
+        }
+      });
       loadSettings();
     </script>
   </body>

@@ -14,6 +14,28 @@ from flask import Flask, Response, jsonify, render_template, request
 # External deps
 import requests
 
+# Optional: YOLO for preview annotations
+YOLO_AVAILABLE = False
+YOLO_MODEL = None
+YOLO_LOCK = threading.Lock()
+YOLO_LAST_ERROR = None
+# Ensure imaging libs are always present for overlays
+try:
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    import numpy as np  # type: ignore
+except Exception:
+    # These are in requirements; if missing, overlays will silently no-op
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageFont = None  # type: ignore
+    np = None  # type: ignore
+try:
+    # Import YOLO; model loads lazily on first use
+    from ultralytics import YOLO  # type: ignore
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO_AVAILABLE = False
+
 # Selenium / undetected chromedriver
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -62,6 +84,9 @@ def load_config() -> Dict:
         # Binaries
         "chromedriver_path": os.getenv("CHROMEDRIVER_PATH", ""),
         "chrome_binary_path": os.getenv("CHROME_BINARY_PATH", ""),
+        # Window sizing (used to fit live preview canvas)
+        "browser_window_width": int(os.getenv("BROWSER_WINDOW_WIDTH", "1280")),
+        "browser_window_height": int(os.getenv("BROWSER_WINDOW_HEIGHT", "800")),
         # Dev / advanced
         "dev_mode": _env_bool("DEV_MODE", False),
         "dev_show_prompts": _env_bool("DEV_SHOW_PROMPTS", True),
@@ -78,6 +103,12 @@ def load_config() -> Dict:
         "preview_enable_pan": _env_bool("PREVIEW_ENABLE_PAN", True),
         "preview_frames": int(os.getenv("PREVIEW_FRAMES", "24")),
         "preview_delay": float(os.getenv("PREVIEW_DELAY", "0.15")),
+        # Preview YOLO overlay
+        "preview_yolo_enable": _env_bool("PREVIEW_YOLO_ENABLE", False),
+        "preview_yolo_model": os.getenv("PREVIEW_YOLO_MODEL", os.getenv("YOLO_MODEL", "yolov8n.pt")),
+        "preview_yolo_conf": float(os.getenv("PREVIEW_YOLO_CONF", "0.25")),
+        "preview_yolo_rich_panel": _env_bool("PREVIEW_YOLO_RICH_PANEL", True),
+        "preview_yolo_topk": int(os.getenv("PREVIEW_YOLO_TOPK", "5")),
     }
     # Overlay with config file if present
     try:
@@ -99,6 +130,278 @@ def save_config(conf: Dict):
 
 
 CONFIG = load_config()
+
+
+# -----------------------------
+# YOLO overlay helper
+# -----------------------------
+def _get_yolo_model():
+    global YOLO_MODEL, YOLO_LAST_ERROR
+    if not YOLO_AVAILABLE:
+        return None
+    if YOLO_MODEL is not None:
+        return YOLO_MODEL
+    # Lazy load and cache
+    with YOLO_LOCK:
+        if YOLO_MODEL is None:
+            try:
+                model_path = CONFIG.get("preview_yolo_model") or "yolov8n.pt"
+                # If path isn't a local file, try to fetch to bin/models
+                if not os.path.isabs(model_path) or not os.path.exists(model_path):
+                    resolved = _ensure_local_yolo_weights(os.path.basename(model_path))
+                    if resolved:
+                        model_path = resolved
+                        CONFIG["preview_yolo_model"] = model_path
+                        save_config(CONFIG)
+                YOLO_MODEL = YOLO(model_path)
+                YOLO_LAST_ERROR = None
+            except Exception as e:
+                YOLO_MODEL = None
+                YOLO_LAST_ERROR = str(e)
+        return YOLO_MODEL
+
+
+def _pick_font(size_px: int):
+    try:
+        # Prefer a truetype font for visibility
+        candidates = [
+            os.path.join(os.getenv("WINDIR", "C:/Windows"), "Fonts", "segoeui.ttf"),
+            os.path.join(os.getenv("WINDIR", "C:/Windows"), "Fonts", "arial.ttf"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]
+        for p in candidates:
+            try:
+                if os.path.exists(p):
+                    return ImageFont.truetype(p, size_px)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def _yolo_annotate_b64(b64_png: str) -> str:
+    """If enabled, draw YOLO boxes with class name only (no global status)."""
+    try:
+        if not CONFIG.get("preview_yolo_enable", False):
+            return b64_png
+        # Decode image for overlays regardless of model availability
+        from io import BytesIO
+        png_bytes = base64.b64decode(b64_png)
+        if Image is None:
+            return b64_png
+        im = Image.open(BytesIO(png_bytes)).convert("RGB")
+        W, H = im.size
+        draw = ImageDraw.Draw(im)
+        # Scale thickness and font to image size for visibility when downscaled in UI
+        thickness = max(3, int(min(W, H) * 0.008))  # ~10 px on 1280x800
+        font_size = max(14, int(min(W, H) * 0.035))  # ~28 px on 800 height
+        font = _pick_font(font_size)
+
+        # Optional: previously drew a debug border around the whole image.
+        # Intentionally disabled to keep preview clean of extra labels/borders.
+
+        model = _get_yolo_model()
+        status_text = "YOLO: unavailable"
+        n_boxes = 0
+        if model is not None:
+            # Predict
+            conf = float(CONFIG.get("preview_yolo_conf", 0.25) or 0.25)
+            res_list = model.predict(im, verbose=False, conf=conf)
+            if res_list:
+                res = res_list[0]
+                boxes = getattr(res, "boxes", None)
+                names = getattr(res, "names", {}) or {}
+                if boxes is not None and len(boxes) > 0:
+                    # Boxes in xyxy
+                    try:
+                        xyxy = boxes.xyxy.cpu().numpy()
+                        cls = boxes.cls.cpu().numpy() if getattr(boxes, "cls", None) is not None else None
+                        confs = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else None
+                        n_boxes = int(xyxy.shape[0])
+                        # Build detection list with richer info
+                        detections = []
+                        for i in range(n_boxes):
+                            x1, y1, x2, y2 = [float(v) for v in xyxy[i].tolist()]
+                            w = max(1.0, x2 - x1)
+                            h = max(1.0, y2 - y1)
+                            area = (w * h) / max(1.0, W * H)
+                            cid = int(cls[i]) if cls is not None else -1
+                            cname = names.get(cid, str(cid))
+                            cconf = float(confs[i]) if confs is not None else 0.0
+                            detections.append({
+                                "cls_id": cid,
+                                "name": cname,
+                                "conf": cconf,
+                                "box": (x1, y1, x2, y2),
+                                "area": area,
+                                "size": (w, h),
+                                "center": (x1 + w / 2.0, y1 + h / 2.0),
+                            })
+
+                        # Class color palette
+                        def color_for(cid: int):
+                            h = (hash(cid) % 360) / 360.0
+                            # Convert HSV to RGB-ish by simple mapping
+                            import colorsys
+                            r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+                            return (int(r * 255), int(g * 255), int(b * 255))
+
+                        # Draw boxes with class-specific colors
+                        for i, det in enumerate(detections):
+                            x1, y1, x2, y2 = det["box"]
+                            cname = det["name"]
+                            color = color_for(det["cls_id"]) if det["cls_id"] is not None else (255, 50, 50)
+                            for t in range(thickness):
+                                draw.rectangle([x1 - t, y1 - t, x2 + t, y2 + t], outline=color)
+                            if font:
+                                # Show class name only (no index or confidence)
+                                label = f"{cname}"
+                                try:
+                                    tw, th_text = draw.textsize(label, font=font)
+                                except Exception:
+                                    tw, th_text = (len(label) * font_size // 2, font_size)
+                                y_text = max(0, y1 - th_text - 6)
+                                draw.rectangle([x1, y_text, x1 + tw + 10, y_text + th_text + 6], fill=(0, 0, 0))
+                                draw.text((x1 + 5, y_text + 3), label, fill=(255, 255, 255), font=font)
+
+                        # Optional rich side panel with thumbnails and summary
+                        if CONFIG.get("preview_yolo_rich_panel", True):
+                            panel_w = max(220, int(W * 0.28))
+                            panel_w = min(panel_w, 420)
+                            # Create new canvas and paste original on left
+                            from PIL import Image as _Image
+                            canvas = _Image.new("RGB", (W + panel_w, H), (0, 0, 0))
+                            canvas.paste(im, (0, 0))
+                            pdraw = ImageDraw.Draw(canvas)
+                            # Panel background
+                            pdraw.rectangle([W, 0, W + panel_w, H], fill=(16, 16, 16))
+                            pad = 10
+                            y = pad
+                            title = f"Detections: {n_boxes} | conf>={conf:.2f}"
+                            try:
+                                tw, th = pdraw.textsize(title, font=font)
+                            except Exception:
+                                tw, th = (len(title) * font_size // 2, font_size)
+                            pdraw.text((W + pad, y), title, fill=(200, 220, 255), font=font)
+                            y += th + 6
+                            # Class counts
+                            counts = {}
+                            for d in detections:
+                                counts[d["name"]] = counts.get(d["name"], 0) + 1
+                            summary = ", ".join(f"{k}×{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])) or "None"
+                            try:
+                                sw, sh = pdraw.textsize(summary, font=font)
+                            except Exception:
+                                sw, sh = (len(summary) * font_size // 2, font_size)
+                            pdraw.text((W + pad, y), summary, fill=(180, 255, 180), font=font)
+                            y += sh + 10
+                            # Thumbnails of top-K by area
+                            topk = max(1, int(CONFIG.get("preview_yolo_topk", 5) or 5))
+                            det_sorted = sorted(detections, key=lambda d: d["area"], reverse=True)[:topk]
+                            thumb_w = panel_w - pad * 2
+                            for idx, d in enumerate(det_sorted, 1):
+                                x1, y1, x2, y2 = [int(v) for v in d["box"]]
+                                x1 = max(0, min(W - 1, x1)); y1 = max(0, min(H - 1, y1))
+                                x2 = max(0, min(W, x2)); y2 = max(0, min(H, y2))
+                                if x2 <= x1 + 1 or y2 <= y1 + 1:
+                                    continue
+                                crop = im.crop((x1, y1, x2, y2))
+                                # Resize maintaining aspect ratio
+                                ratio = thumb_w / max(1, crop.width)
+                                thh = max(30, int(crop.height * ratio))
+                                try:
+                                    crop = crop.resize((thumb_w, thh))
+                                except Exception:
+                                    pass
+                                canvas.paste(crop, (W + pad, y))
+                                # Caption
+                                caption = f"{idx}. {d['name']} {d['conf']:.2f} | {int(d['size'][0])}×{int(d['size'][1])} ({int(d['area']*100)}%)"
+                                y += thh + 4
+                                pdraw.text((W + pad, y), caption, fill=(230, 230, 230), font=font)
+                                # Advance
+                                try:
+                                    _, ch = pdraw.textsize(caption, font=font)
+                                except Exception:
+                                    ch = font_size
+                                y += ch + 8
+                            # Replace im with canvas for final encode
+                            im = canvas
+                    except Exception:
+                        pass
+                else:
+                    # One retry at lower confidence to increase recall on small images
+                    try:
+                        low_conf = max(0.05, conf * 0.5)
+                        res_list = model.predict(im, verbose=False, conf=low_conf)
+                        if res_list:
+                            res = res_list[0]
+                            boxes = getattr(res, "boxes", None)
+                            names = getattr(res, "names", {}) or {}
+                            if boxes is not None and len(boxes) > 0:
+                                xyxy = boxes.xyxy.cpu().numpy()
+                                cls = boxes.cls.cpu().numpy() if getattr(boxes, "cls", None) is not None else None
+                                confs = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else None
+                                n_boxes = int(xyxy.shape[0])
+                                color = (255, 50, 50)
+                                for i in range(n_boxes):
+                                    x1, y1, x2, y2 = xyxy[i].tolist()
+                                    label = None
+                                    if cls is not None:
+                                        cid = int(cls[i])
+                                        name = names.get(cid, str(cid))
+                                        # Show class name only (drop confidence)
+                                        label = name
+                                    for t in range(thickness):
+                                        draw.rectangle([x1 - t, y1 - t, x2 + t, y2 + t], outline=color)
+                                    if label and font:
+                                        tw, th = draw.textsize(label, font=font)
+                                        y_text = max(0, y1 - th - 4)
+                                        draw.rectangle([x1, y_text, x1 + tw + 8, y_text + th + 6], fill=(0, 0, 0))
+                                        draw.text((x1 + 4, y_text + 3), label, fill=(255, 255, 255), font=font)
+                    except Exception:
+                        pass
+            status_text = f"YOLO: {n_boxes}"
+        elif YOLO_LAST_ERROR:
+            status_text = "YOLO: error"
+        # Do not draw the global top-left status label ("YOLO: n"). Intentionally removed.
+        # Encode back to PNG
+        out = BytesIO()
+        im.save(out, format="PNG")
+        return base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception:
+        return b64_png
+
+
+def _ensure_local_yolo_weights(name: str) -> Optional[str]:
+    """Ensure a YOLO .pt file exists locally. Download to bin/models if missing.
+    Returns local path or None on failure.
+    """
+    try:
+        if not name or not name.endswith('.pt'):
+            return None
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        dest_dir = os.path.join(base_dir, 'bin', 'models')
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, name)
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 1_000_000:
+            return dest_path
+        url = f"https://github.com/ultralytics/assets/releases/latest/download/{name}"
+        r = requests.get(url, stream=True, timeout=60)
+        r.raise_for_status()
+        tmp_path = dest_path + '.part'
+        with open(tmp_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        os.replace(tmp_path, dest_path)
+        return dest_path
+    except Exception:
+        return None
 
 
 # -----------------------------
@@ -164,14 +467,7 @@ def allowed_url(url: str) -> bool:
     if not (url.startswith("http://") or url.startswith("https://")):
         return False
     # Basic disallow list (auth/paywall heavy)
-    blocked = [
-        "accounts.google.",
-        "facebook.com/login",
-        "x.com/i/flow",
-        "linkedin.com/uas/login",
-        "github.com/login",
-        "auth.",
-    ]
+    blocked = []
     return not any(b in url for b in blocked)
 
 
@@ -335,7 +631,14 @@ class Browser:
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--window-size=1280,800")
+        try:
+            w = int(CONFIG.get("browser_window_width", 1280) or 1280)
+            h = int(CONFIG.get("browser_window_height", 800) or 800)
+            w = max(640, min(4096, w))
+            h = max(480, min(2304, h))
+            options.add_argument(f"--window-size={w},{h}")
+        except Exception:
+            options.add_argument("--window-size=1280,800")
         options.add_argument("--incognito")
         if binary_path:
             try:
@@ -732,6 +1035,21 @@ class BrowserManager:
                 raise RuntimeError("Browser is not running. Start it from the Settings/Controls panel.")
             return self.browser
 
+    def resize(self, width: int, height: int) -> Dict:
+        with self._lock:
+            if self.browser is None:
+                raise RuntimeError("Browser is not running.")
+            try:
+                width = max(640, min(4096, int(width)))
+                height = max(480, min(2304, int(height)))
+            except Exception:
+                raise RuntimeError("Invalid width/height")
+            try:
+                self.browser.driver.set_window_size(width, height)
+            except Exception as e:
+                raise RuntimeError(f"Failed to resize window: {e}")
+            return {"width": width, "height": height}
+
 
 BROWSER_MANAGER = BrowserManager()
 
@@ -872,7 +1190,55 @@ def api_health():
         info["packages"]["requests"] = getattr(rq, "__version__", "?")
     except Exception:
         pass
+    # YOLO health
+    try:
+        import ultralytics as ul
+        info["packages"]["ultralytics"] = getattr(ul, "__version__", "?")
+    except Exception as e:
+        info["packages"]["ultralytics"] = f"missing ({e})"
+    try:
+        import PIL
+        info["packages"]["Pillow"] = getattr(PIL, "__version__", "?")
+    except Exception as e:
+        info["packages"]["Pillow"] = f"missing ({e})"
+    try:
+        import numpy as _np
+        info["packages"]["numpy"] = getattr(_np, "__version__", "?")
+    except Exception as e:
+        info["packages"]["numpy"] = f"missing ({e})"
+    try:
+        import torch
+        info["packages"]["torch"] = getattr(torch, "__version__", "?")
+        info["packages"]["torch_cuda"] = torch.cuda.is_available()
+    except Exception as e:
+        info["packages"]["torch"] = f"missing ({e})"
+    info["yolo"] = {
+        "enabled": CONFIG.get("preview_yolo_enable", False),
+        "available": YOLO_AVAILABLE,
+        "model_loaded": YOLO_MODEL is not None,
+        "model_path": CONFIG.get("preview_yolo_model"),
+        "conf": CONFIG.get("preview_yolo_conf"),
+        "last_error": YOLO_LAST_ERROR,
+        "model_exists": os.path.exists(CONFIG.get("preview_yolo_model", "")) if isinstance(CONFIG.get("preview_yolo_model"), str) else False,
+    }
     return jsonify({"ok": True, "health": info})
+
+
+@app.post("/api/yolo/ensure")
+def api_yolo_ensure():
+    """Attempt to ensure YOLO weights are available locally and model can load."""
+    try:
+        name = os.path.basename(CONFIG.get("preview_yolo_model") or "yolov8n.pt")
+        local = _ensure_local_yolo_weights(name)
+        model = _get_yolo_model()
+        return jsonify({
+            "ok": model is not None,
+            "local_path": local or CONFIG.get("preview_yolo_model"),
+            "loaded": model is not None,
+            "last_error": YOLO_LAST_ERROR,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.get("/cache/<cache_id>")
 def get_cached_html(cache_id: str):
@@ -936,6 +1302,17 @@ def browser_diagnose():
 @app.post("/api/browser/start")
 def browser_start():
     try:
+        # Optional width/height to set window size prior to start
+        try:
+            data = request.get_json(force=False, silent=True) or {}
+            w = int(data.get("width")) if data and data.get("width") else None
+            h = int(data.get("height")) if data and data.get("height") else None
+            if w and h:
+                CONFIG["browser_window_width"] = max(640, min(4096, w))
+                CONFIG["browser_window_height"] = max(480, min(2304, h))
+                save_config(CONFIG)
+        except Exception:
+            pass
         # Start without blocking the request
         status = BROWSER_MANAGER.start_async(CONFIG)
         return jsonify({"ok": True, **status})
@@ -959,6 +1336,25 @@ def browser_restart():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.post("/api/browser/resize")
+def browser_resize():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        w = int(data.get("width"))
+        h = int(data.get("height"))
+        CONFIG["browser_window_width"] = max(640, min(4096, w))
+        CONFIG["browser_window_height"] = max(480, min(2304, h))
+        save_config(CONFIG)
+        # If running, apply immediately
+        try:
+            out = BROWSER_MANAGER.resize(CONFIG["browser_window_width"], CONFIG["browser_window_height"])
+            return jsonify({"ok": True, **out, "applied": True})
+        except Exception as e:
+            # Not running, that's fine; will apply on next start
+            return jsonify({"ok": True, "applied": False, "error": str(e)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
 @app.get("/api/browser/capture")
 def browser_capture():
     try:
@@ -967,6 +1363,11 @@ def browser_capture():
         b64 = br.screenshot_b64()
         if not b64:
             return jsonify({"ok": False, "error": "no_screenshot"}), 500
+        # Optionally annotate with YOLO
+        try:
+            b64 = _yolo_annotate_b64(b64)
+        except Exception:
+            pass
         return jsonify({"ok": True, "b64": b64})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1072,10 +1473,10 @@ def api_message():
                     delay = max(0.05, float(conf.get("preview_delay", 0.15)))
                     if conf.get("preview_enable_pan", True):
                         for frame in browser.pan_screenshots(frames=frames, delay=delay):
-                            yield sse("screenshot", {"b64": frame})
+                            yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
                     else:
                         for frame in browser.stream_screenshots(frames=frames, delay=delay):
-                            yield sse("screenshot", {"b64": frame})
+                            yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
                 except Exception:
                     pass
                 collected_results.extend(results)
@@ -1102,10 +1503,10 @@ def api_message():
                         delay = max(0.05, float(conf.get("preview_delay", 0.15)))
                         if conf.get("preview_enable_pan", True):
                             for frame in browser.pan_screenshots(frames=frames, delay=delay):
-                                yield sse("screenshot", {"b64": frame})
+                                yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
                         else:
                             for frame in browser.stream_screenshots(frames=frames, delay=delay):
-                                yield sse("screenshot", {"b64": frame})
+                                yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
                     except Exception:
                         pass
                     pages_to_read.append(page)
@@ -1137,10 +1538,10 @@ def api_message():
                             delay = max(0.05, float(conf.get("preview_delay", 0.15)))
                             if conf.get("preview_enable_pan", True):
                                 for frame in browser.pan_screenshots(frames=frames, delay=delay):
-                                    yield sse("screenshot", {"b64": frame})
+                                    yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
                             else:
                                 for frame in browser.stream_screenshots(frames=frames, delay=delay):
-                                    yield sse("screenshot", {"b64": frame})
+                                    yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
                         except Exception:
                             pass
                         pages_to_read.append(page)
