@@ -8,7 +8,7 @@ import re
 import base64
 import datetime
 from html import unescape as html_unescape
-from typing import Dict, List, Generator, Optional
+from typing import Dict, List, Generator, Optional, Tuple
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -113,6 +113,12 @@ def load_config() -> Dict:
         "preview_yolo_conf": float(os.getenv("PREVIEW_YOLO_CONF", "0.25")),
         "preview_yolo_rich_panel": _env_bool("PREVIEW_YOLO_RICH_PANEL", True),
         "preview_yolo_topk": int(os.getenv("PREVIEW_YOLO_TOPK", "5")),
+        # Autonomy
+        "enable_autonomy": _env_bool("ENABLE_AUTONOMY", True),
+        "max_iterations": int(os.getenv("MAX_ITERATIONS", "3")),
+        "evaluation_threshold": float(os.getenv("EVALUATION_THRESHOLD", "0.75")),
+        "max_query_refinements": int(os.getenv("MAX_QUERY_REFINEMENTS", "1")),
+        "max_queries_per_iter": int(os.getenv("MAX_QUERIES_PER_ITER", "4")),
     }
     # Overlay with config file if present
     try:
@@ -937,24 +943,35 @@ class Browser:
     def open_and_extract(self, url: str, timeout: int = 25) -> Optional[Dict]:
         if not allowed_url(url):
             return None
-        try:
-            url = normalize_url(url)
-            self.driver.get(url)
-            self._wait_ready(timeout)
-            time.sleep(1.2)  # allow dynamic content to settle
-            title = (self.driver.title or "").strip()
-            text = self.driver.execute_script("return document.body ? document.body.innerText : '';")
-            if text:
-                text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-            if text and len(text) > 12000:
-                text = text[:12000]
-            return {"url": url, "title": title or url, "text": text or ""}
-        except Exception:
-            # Try HTTP fallback
+        url = normalize_url(url)
+        # Retry webdriver open a couple of times with small backoff, then HTTP fallback
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
             try:
-                return self._http_fetch(url, timeout=timeout)
-            except Exception:
-                return None
+                self.driver.get(url)
+                self._wait_ready(timeout)
+                time.sleep(1.0 + 0.2 * attempt)  # allow dynamic content to settle
+                title = (self.driver.title or "").strip()
+                text = self.driver.execute_script("return document.body ? document.body.innerText : '';")
+                if text:
+                    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+                if text and len(text) > 12000:
+                    text = text[:12000]
+                return {"url": url, "title": title or url, "text": text or ""}
+            except Exception as e:
+                last_err = e
+                try:
+                    time.sleep(0.6)
+                    # light refresh before next attempt
+                    self.driver.execute_script("location.reload()")
+                    self._wait_ready(min(10, timeout))
+                except Exception:
+                    pass
+        # Try HTTP fallback
+        try:
+            return self._http_fetch(url, timeout=timeout)
+        except Exception:
+            return None
 
     # ---- HTTP fallbacks (no webdriver) ----
     def _http_search(self, query: str, max_results: int = 5) -> List[Dict]:
@@ -1187,18 +1204,27 @@ class ResearchAgent:
         self.answer_params = answer_params or {}
         self.dev_show_prompts = dev_show_prompts
 
-    def make_plan(self, question: str) -> Dict:
+    def make_plan(self, question: str, context: Optional[Dict] = None) -> Tuple[Dict, Optional[Dict], Optional[Dict]]:
+        ctx = context or {}
+        prev_queries = ctx.get("previous_queries", [])
+        missing = ctx.get("missing_aspects", [])
+        visited = ctx.get("visited_urls", [])
         sys_prompt = (
-            "You are a research planner. Given a user question, create a concise plan with: "
-            "1) 2-4 specific web search queries, 2) short ordered steps to validate facts across multiple sources.\n"
-            "Return strict JSON with keys: 'queries' (array of strings), 'steps' (array of strings), and 'rationale' (1-2 sentence high-level justification)."
+            "You are a research planner for a web-research agent. Given a user question and context from prior iterations, "
+            "create a concise plan with: 1) 2-6 specific web search queries (avoid duplicates and previously tried queries), 2) short ordered steps to validate facts across multiple sources, 3) 1-2 sentence rationale.\n"
+            "If context lists missing aspects, target them explicitly. Prefer trustworthy, recent sources. Return STRICT JSON with keys: 'queries' (array of strings), 'steps' (array of strings), 'rationale' (string)."
         )
-        user = f"Question: {question}\nReturn only JSON."
+        user = (
+            f"Question: {question}\n"
+            f"Previously tried queries: {prev_queries}\n"
+            f"Missing aspects to cover: {missing}\n"
+            f"Already visited URLs (avoid unless necessary): {visited}\n"
+            "Return JSON only."
+        )
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user},
         ]
-        # Non-streaming small call for planning
         try:
             resp = self.planning_llm.chat(messages, model=self.planning_model, stream=False, extra_params=self.planning_params)
             data = resp.json()
@@ -1210,12 +1236,12 @@ class ResearchAgent:
                 queries = [question]
             usage = data.get("usage")
             debug = {"phase": "plan", "model": self.planning_model, "messages": messages}
-            return {"queries": [sanitize_query(q) for q in queries][:4], "steps": steps[:6], "rationale": plan.get("rationale")}, usage, debug
+            return {"queries": [sanitize_query(q) for q in queries][:6], "steps": steps[:8], "rationale": plan.get("rationale")}, usage, debug
         except Exception:
             # Fallback plan
             base = sanitize_query(question)
             return {
-                "queries": [base, f"site:.gov {base}", f"site:.edu {base}"],
+                "queries": [base, f"site:.gov {base}", f"site:.edu {base}", f"filetype:pdf {base}"],
                 "steps": ["Search the web", "Open top sources", "Cross-verify facts", "Summarize with citations"],
             }, None, None
 
@@ -1256,6 +1282,90 @@ class ResearchAgent:
         ]
         yield {"event": "prompt", "phase": "answer", "model": self.answer_model, "messages": messages}
         yield from self.answer_llm.stream_chat_text(messages, model=self.answer_model, extra_params=self.answer_params)
+
+    def evaluate_answer(self, question: str, draft_html: str, sources: List[Dict]) -> Tuple[Dict, Optional[Dict], Optional[Dict]]:
+        """Return dict with: { satisfactory: bool, score: float 0..1, missing_aspects: [..], critique: str }.
+        Uses the answer LLM for evaluation; falls back to simple heuristics.
+        """
+        sys_prompt = (
+            "You are a meticulous evaluator for a research agent. Given a user question, a candidate HTML answer, and a list of sources, "
+            "assess completeness, correctness, and citation coverage. Return STRICT JSON with keys: 'satisfactory' (bool), 'score' (0..1), "
+            "'missing_aspects' (array of short strings), 'critique' (short string)."
+        )
+        # Compact sources context for evaluator
+        numbered = []
+        for i, s in enumerate(sources, 1):
+            titled = f"[{i}] {s.get('title','').strip()}\nURL: {s.get('url','')}"
+            numbered.append(titled)
+        src_list = "\n".join(numbered[:12])
+        user = (
+            f"Question: {question}\n\n"
+            f"Draft (HTML):\n{draft_html[:6000]}\n\n"
+            f"Sources:\n{src_list}\n\n"
+            "Return JSON only."
+        )
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user},
+        ]
+        try:
+            resp = self.answer_llm.chat(messages, model=self.answer_model, stream=False, extra_params={"temperature": 0.0})
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            obj = json.loads(self._extract_json(content))
+            # Normalize
+            sat = bool(obj.get("satisfactory"))
+            sc = float(obj.get("score", 0.0))
+            miss = obj.get("missing_aspects") or []
+            cri = obj.get("critique") or ""
+            usage = data.get("usage")
+            debug = {"phase": "evaluate", "model": self.answer_model, "messages": messages}
+            return {"satisfactory": sat, "score": max(0.0, min(1.0, sc)), "missing_aspects": miss, "critique": cri}, usage, debug
+        except Exception:
+            # Heuristic fallback: check that question keywords and citations exist
+            q = sanitize_query(question).lower()
+            kws = [w for w in re.split(r"[^a-z0-9]+", q) if w and len(w) >= 4][:8]
+            ans = (draft_html or "").lower()
+            hits = sum(1 for w in kws if w in ans)
+            has_cite = bool(re.search(r"\[[0-9]+\]", ans))
+            score = 0.3 + 0.05 * hits + (0.1 if has_cite else 0.0)
+            score = max(0.0, min(1.0, score))
+            return {"satisfactory": score >= 0.75, "score": score, "missing_aspects": [], "critique": "heuristic"}, None, None
+
+    def refine_queries(self, question: str, prev_queries: List[str], missing_aspects: List[str]) -> List[str]:
+        """Use planning LLM to propose alternative queries targeting missing aspects and avoiding duplicates."""
+        sys_prompt = (
+            "You help refine web search queries. Propose 2-4 alternative queries for the question, targeting the missing aspects. "
+            "Avoid previously tried queries and keep queries concise. Return JSON {\"queries\": [..]} only."
+        )
+        user = (
+            f"Question: {question}\n"
+            f"Previously tried: {prev_queries}\n"
+            f"Missing: {missing_aspects}\n"
+            "Return JSON only."
+        )
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user},
+        ]
+        try:
+            resp = self.planning_llm.chat(messages, model=self.planning_model, stream=False, extra_params={"temperature": 0.2, "top_p": 1})
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            obj = json.loads(self._extract_json(content))
+            qs = obj.get("queries") or []
+            out = []
+            seen = set(q.strip().lower() for q in prev_queries)
+            for q in qs:
+                qn = sanitize_query(q)
+                if qn and qn.lower() not in seen:
+                    out.append(qn)
+            return out[:4]
+        except Exception:
+            base = sanitize_query(question)
+            alts = [f"{base} 2025", f"site:.edu {base}", f"site:.gov {base}", f"filetype:pdf {base}"]
+            seen = set(q.strip().lower() for q in prev_queries)
+            return [q for q in alts if q.lower() not in seen][:4]
 
 
 # -----------------------------
@@ -1550,6 +1660,200 @@ def api_message():
             },
             dev_show_prompts=conf.get("dev_show_prompts", False),
         )
+        # Autonomous iterative loop (Plan -> Act -> Summarize -> Evaluate -> Iterate)
+        if conf.get("enable_autonomy", True):
+            try:
+                max_iter = max(1, int(conf.get("max_iterations", 3) or 3))
+                eval_threshold = float(conf.get("evaluation_threshold", 0.75) or 0.75)
+                max_queries_iter = max(1, int(conf.get("max_queries_per_iter", 4) or 4))
+
+                # Ensure persistent browser is running (fallback to HTTP if unavailable)
+                browser = None
+                try:
+                    browser = BROWSER_MANAGER.get_or_start(conf)
+                except Exception as e:
+                    yield sse("status", {"message": f"Browser unavailable, using HTTP fallback. ({e})"})
+
+                all_queries_tried: List[str] = [sr.get("query") for sr in sess.search_results] if sess.search_results else []
+                visited_urls = list(sess.scraped_pages.keys()) if sess.scraped_pages else []
+                last_eval: Optional[Dict] = None
+                final_answer: str = ""
+                collected_results: List[Dict] = []
+
+                for iteration in range(1, max_iter + 1):
+                    yield sse("trace", {"phase": "plan", "iteration": iteration, "message": "Planning iteration"})
+                    context = {
+                        "previous_queries": all_queries_tried[-12:],
+                        "missing_aspects": (last_eval or {}).get("missing_aspects", []),
+                        "visited_urls": visited_urls[-20:],
+                    }
+                    plan, plan_usage, plan_debug = agent.make_plan(user_message, context=context)
+                    sess.plan = plan
+                    yield sse("llm_meta", {"phase": "plan", "iteration": iteration, "model": conf["planning_model"], "base_url": conf["planning_base_url"]})
+                    if plan_usage:
+                        yield sse("usage", {"phase": "plan", "iteration": iteration, "usage": plan_usage, "model": conf["planning_model"]})
+                    if plan.get("rationale"):
+                        yield sse("thinking", {"phase": "plan", "iteration": iteration, "text": plan.get("rationale")})
+                    if plan_debug and conf.get("dev_show_prompts", False):
+                        yield sse("prompt", plan_debug)
+                    yield sse("plan", {"iteration": iteration, **plan})
+                    yield sse("trace", {"phase": "plan", "iteration": iteration, "message": "Plan created", "steps": plan.get("steps", [])})
+                    sess.save_to_db()
+
+                    # ACT: search queries
+                    queries = [q for q in (plan.get("queries") or []) if q]
+                    if not queries:
+                        queries = [user_message]
+                    queries = queries[:max_queries_iter]
+                    yield sse("trace", {"phase": "act", "iteration": iteration, "message": "Executing search queries", "queries": queries})
+                    for q in queries:
+                        if q in all_queries_tried:
+                            continue
+                        all_queries_tried.append(q)
+                        yield sse("status", {"message": f"Searching for: {q}", "iteration": iteration})
+                        if browser:
+                            results = browser.search(q, max_results=conf.get("search_results_per_query", 5))
+                        else:
+                            try:
+                                results = Browser._http_search(self=None, query=q, max_results=conf.get("search_results_per_query", 5))  # type: ignore
+                            except Exception:
+                                results = []
+                        sess.search_results.append({"query": q, "results": results})
+                        yield sse("search_results", {"iteration": iteration, "query": q, "results": results})
+                        # If poor results, attempt quick refinement once
+                        if (not results) and int(conf.get("max_query_refinements", 1) or 1) > 0:
+                            alts = agent.refine_queries(user_message, prev_queries=all_queries_tried, missing_aspects=(last_eval or {}).get("missing_aspects", []))
+                            for alt in alts[: int(conf.get("max_query_refinements", 1) or 1)]:
+                                if alt in all_queries_tried:
+                                    continue
+                                all_queries_tried.append(alt)
+                                yield sse("status", {"message": f"Refined search: {alt}", "iteration": iteration})
+                                if browser:
+                                    results = browser.search(alt, max_results=conf.get("search_results_per_query", 5))
+                                else:
+                                    try:
+                                        results = Browser._http_search(self=None, query=alt, max_results=conf.get("search_results_per_query", 5))  # type: ignore
+                                    except Exception:
+                                        results = []
+                                sess.search_results.append({"query": alt, "results": results})
+                                yield sse("search_results", {"iteration": iteration, "query": alt, "results": results})
+                                if results:
+                                    break
+                        collected_results.extend(results or [])
+                        # Optional preview frames
+                        try:
+                            if not browser:
+                                raise RuntimeError("no_browser")
+                            frames = max(3, int(conf.get("preview_frames", 24)))
+                            delay = max(0.05, float(conf.get("preview_delay", 0.15)))
+                            if conf.get("preview_enable_pan", True):
+                                for frame in browser.pan_screenshots(frames=frames, delay=delay):
+                                    yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
+                            else:
+                                for frame in browser.stream_screenshots(frames=frames, delay=delay):
+                                    yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
+                        except Exception:
+                            pass
+                    sess.save_to_db()
+
+                    # Open pages (prioritize clicked on first iteration)
+                    pages_to_read: List[Dict] = []
+                    opened = 0
+                    max_open = int(conf.get("pages_to_open", 10) or 10)
+                    try_urls: List[str] = []
+                    if iteration == 1 and clicked_url and allowed_url(clicked_url):
+                        try_urls.append(clicked_url)
+                    for r in collected_results:
+                        u = r.get("url")
+                        if u and u not in try_urls:
+                            try_urls.append(u)
+                    for url in try_urls:
+                        if opened >= max_open:
+                            break
+                        if not url or url in sess.scraped_pages:
+                            continue
+                        page = None
+                        if browser:
+                            page = browser.open_and_extract(url)
+                        if not page:
+                            try:
+                                page = Browser._http_fetch(self=None, url=url, timeout=conf.get("browser_pageload_timeout", 25))  # type: ignore
+                            except Exception:
+                                page = None
+                        if page and page.get("text"):
+                            sess.scraped_pages[page["url"]] = page
+                            visited_urls.append(page["url"])
+                            yield sse("read_page", {"iteration": iteration, "url": page["url"], "title": page["title"]})
+                            # Optional screenshots
+                            try:
+                                if not browser:
+                                    raise RuntimeError("no_browser")
+                                frames = max(3, int(conf.get("preview_frames", 24)))
+                                delay = max(0.05, float(conf.get("preview_delay", 0.15)))
+                                if conf.get("preview_enable_pan", True):
+                                    for frame in browser.pan_screenshots(frames=frames, delay=delay):
+                                        yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
+                                else:
+                                    for frame in browser.stream_screenshots(frames=frames, delay=delay):
+                                        yield sse("screenshot", {"b64": _yolo_annotate_b64(frame)})
+                            except Exception:
+                                pass
+                            pages_to_read.append(page)
+                            opened += 1
+                    if not pages_to_read:
+                        pages_to_read = list(sess.scraped_pages.values())[: max_open]
+                    if not pages_to_read:
+                        yield sse("error", {"message": "No relevant pages could be opened.", "iteration": iteration})
+                        # Try another iteration
+                        continue
+
+                    # Summarize
+                    yield sse("status", {"message": "Summarizing findings...", "iteration": iteration})
+                    yield sse("trace", {"phase": "summarize", "iteration": iteration, "message": "Generating answer from gathered sources"})
+                    stream = agent.summarize_stream(user_message, pages_to_read)
+                    full_text: List[str] = []
+                    for event in stream:
+                        if isinstance(event, dict):
+                            et = event.get("event")
+                            if et == "prompt":
+                                if conf.get("dev_show_prompts", False):
+                                    yield sse("prompt", event)
+                                continue
+                            if et == "meta":
+                                yield sse("llm_meta", event.get("meta", {}))
+                            elif et == "token":
+                                tok = event.get("text", "")
+                                full_text.append(tok)
+                                yield sse("chunk", {"iteration": iteration, "text": tok})
+                            elif et == "usage":
+                                usage = event.get("usage", {})
+                                model_used = event.get("model")
+                                yield sse("usage", {"phase": "answer", "iteration": iteration, "usage": usage, "model": model_used})
+                            elif et == "error":
+                                yield sse("error", {"message": event.get("message", "LLM error"), "iteration": iteration})
+                        else:
+                            full_text.append(str(event))
+                            yield sse("chunk", {"iteration": iteration, "text": str(event)})
+                    final_answer = "".join(full_text)
+
+                    # Evaluate
+                    ev, ev_usage, ev_debug = agent.evaluate_answer(user_message, final_answer, pages_to_read)
+                    if ev_usage:
+                        yield sse("usage", {"phase": "evaluate", "iteration": iteration, "usage": ev_usage, "model": conf.get("answer_model")})
+                    if ev_debug and conf.get("dev_show_prompts", False):
+                        yield sse("prompt", ev_debug)
+                    last_eval = ev
+                    yield sse("evaluation", {"iteration": iteration, **ev})
+                    if ev.get("satisfactory") or float(ev.get("score", 0.0)) >= eval_threshold:
+                        break
+
+                if final_answer:
+                    sess.messages.append({"role": "assistant", "content": final_answer})
+                    sess.save_to_db()
+                yield sse("done", {"ok": True, "iterations": iteration, "autonomous": True})
+                return
+            except Exception as e:
+                yield sse("error", {"message": f"Unexpected error (autonomous): {e}"})
         browser = None
         try:
             # PLAN

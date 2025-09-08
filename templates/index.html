@@ -9,15 +9,18 @@
   </head>
   <body>
     <div class="app">
-      <header>
-        <h1>Deep Research Assistant</h1>
-        <p class="subtitle">Plan → Act → Summarize with citations</p>
-        <div><a href="/settings" style="color:#9bb1c9; font-size:12px;">Settings</a></div>
-        <div class="controls">
+      <header class="neo-header">
+        <div class="title-wrap">
+          <h1 class="neon">Deep Research Assistant</h1>
+          <p class="subtitle">Autonomous Plan → Act → Summarize with validation</p>
+        </div>
+        <div class="header-actions">
+          <a href="/settings" class="link">Settings</a>
+          <span id="autonomy-badge" class="chip muted">Autonomy: …</span>
           <span id="browser-status" class="badge">Browser: unknown</span>
-          <button id="btn-start" class="btn-small" type="button">Start Browser</button>
-          <button id="btn-restart" class="btn-small" type="button">Restart Browser</button>
-          <button id="btn-stop" class="btn-small" type="button">Stop Browser</button>
+          <button id="btn-start" class="btn-small" type="button">Start</button>
+          <button id="btn-restart" class="btn-small" type="button">Restart</button>
+          <button id="btn-stop" class="btn-small" type="button">Stop</button>
         </div>
       </header>
 
@@ -35,11 +38,12 @@
         <aside class="right">
           <div class="panel tall" style="padding:0;">
             <div class="label" style="padding:8px 8px 0 8px;">Live Browser Monitor</div>
-            <div id="screenshot-wrap" class="screenshot-wrap big" style="border:none; border-top:1px solid #1b2735; border-radius:0 0 6px 6px;">
+            <div id="screenshot-wrap" class="screenshot-wrap big holo">
               <img id="page-screenshot" alt="screenshot" />
             </div>
+            <div id="filmstrip" class="filmstrip"></div>
           </div>
-        </aside>
+      </aside>
       </main>
 
       <footer>

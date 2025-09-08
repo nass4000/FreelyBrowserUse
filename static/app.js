@@ -8,6 +8,8 @@ const restartBtn = document.getElementById('btn-restart');
 const stopBtn = document.getElementById('btn-stop');
 const browserStatusEl = document.getElementById('browser-status');
 const screenshotWrapEl = document.getElementById('screenshot-wrap');
+const autonomyBadgeEl = document.getElementById('autonomy-badge');
+const filmstripEl = document.getElementById('filmstrip');
 
 let sessionId = null;
 let lastUserMessage = '';
@@ -16,6 +18,7 @@ const screenshotEl = document.getElementById('page-screenshot');
 let livePreviewTimer = null;
 let lastStreamAt = 0;
 let statusTimer = null;
+let filmstrip = [];
 
 function debounce(fn, ms) {
   let t = null;
@@ -58,6 +61,19 @@ function addAssistantContainer() {
   content.className = 'assistant-content';
   const actions = document.createElement('div');
   actions.className = 'assistant-actions';
+  // Metrics bar (gauge + chips)
+  const metrics = document.createElement('div');
+  metrics.className = 'metrics';
+  const gauge = document.createElement('div');
+  gauge.className = 'gauge';
+  const ginner = document.createElement('div');
+  ginner.className = 'gauge-inner';
+  const glabel = document.createElement('span'); glabel.className = 'gauge-label'; glabel.textContent = 'Quality';
+  const gval = document.createElement('span'); gval.className = 'gauge-value'; gval.textContent = '--';
+  ginner.appendChild(glabel); ginner.appendChild(gval);
+  gauge.appendChild(ginner);
+  const chips = document.createElement('div'); chips.className = 'chips';
+  metrics.appendChild(gauge); metrics.appendChild(chips);
   const timeline = document.createElement('div');
   timeline.className = 'timeline-block';
   const th = document.createElement('div');
@@ -65,11 +81,12 @@ function addAssistantContainer() {
   th.textContent = 'Timeline';
   timeline.appendChild(th);
   wrap.appendChild(actions);
+  wrap.appendChild(metrics);
   wrap.appendChild(timeline);
   wrap.appendChild(content);
   chatEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
-  return { wrap, actions, content, timeline };
+  return { wrap, actions, content, timeline, gauge, gval, chips };
 }
 
 function addStatus(actionsEl, text) {
@@ -215,9 +232,10 @@ async function sendMessage(message, clickedUrl = null) {
   addUserMessage(message);
   inputEl.value = '';
 
-  const { actions, content, timeline } = addAssistantContainer();
+  const { actions, content, timeline, gauge, gval, chips } = addAssistantContainer();
   addStatus(actions, 'Starting...');
   let htmlBuffer = '';
+  let currentIteration = 0;
 
   const ctrl = new AbortController();
   streamingController = ctrl;
@@ -253,6 +271,14 @@ async function sendMessage(message, clickedUrl = null) {
             break;
           case 'plan':
             renderPlan(actions, data);
+            if (typeof data.iteration === 'number') {
+              if (data.iteration !== currentIteration) {
+                currentIteration = data.iteration;
+                const c = document.createElement('span'); c.className = 'chip'; c.textContent = `Iter ${currentIteration}`; chips.appendChild(c);
+              }
+            } else {
+              if (currentIteration === 0) { currentIteration = 1; const c = document.createElement('span'); c.className = 'chip'; c.textContent = `Iter ${currentIteration}`; chips.appendChild(c); }
+            }
             addTimeline(timeline, 'Plan ready');
             break;
           case 'search_results':
@@ -268,11 +294,28 @@ async function sendMessage(message, clickedUrl = null) {
             content.innerHTML = sanitizeHTML(htmlBuffer);
             chatEl.scrollTop = chatEl.scrollHeight;
             break;
+          case 'evaluation':
+            try {
+              const score = Math.max(0, Math.min(1, Number(data.score) || 0));
+              gauge.style.setProperty('--p', String(score * 100));
+              gval.textContent = `${Math.round(score * 100)}%`;
+              const sat = !!data.satisfactory;
+              const sChip = document.createElement('span'); sChip.className = 'chip ' + (sat ? 'ok' : 'warn'); sChip.textContent = sat ? 'Satisfactory' : 'Needs more'; chips.appendChild(sChip);
+              if (Array.isArray(data.missing_aspects)) {
+                data.missing_aspects.slice(0, 6).forEach(m => { const ch = document.createElement('span'); ch.className='chip warn'; ch.textContent = m; chips.appendChild(ch); });
+              }
+              addTimeline(timeline, `Evaluation score: ${Math.round(score*100)}%`);
+            } catch (e) {}
+            break;
           case 'screenshot':
             try {
               if (data.b64) {
                 screenshotEl.src = `data:image/png;base64,${data.b64}`;
                 lastStreamAt = Date.now();
+                // Filmstrip
+                filmstrip.push(data.b64);
+                if (filmstrip.length > 12) filmstrip.shift();
+                renderFilmstrip();
               }
             } catch (e) {}
             break;
@@ -474,3 +517,29 @@ function startStatusPolling() {
 refreshBrowserStatus();
 startStatusPolling();
 window.addEventListener('resize', debouncedResizeDriver);
+
+// Filmstrip rendering
+function renderFilmstrip() {
+  if (!filmstripEl) return;
+  filmstripEl.innerHTML = '';
+  filmstrip.forEach((b64, idx) => {
+    const img = document.createElement('img');
+    img.src = `data:image/png;base64,${b64}`;
+    img.title = `Frame ${idx+1}`;
+    img.addEventListener('click', () => { screenshotEl.src = img.src; });
+    filmstripEl.appendChild(img);
+  });
+}
+
+// Show autonomy state in header
+(async function initAutonomyBadge(){
+  try {
+    const res = await fetch('/api/settings');
+    const conf = await res.json();
+    if (autonomyBadgeEl && typeof conf.enable_autonomy !== 'undefined') {
+      const on = !!conf.enable_autonomy;
+      autonomyBadgeEl.textContent = `Autonomy: ${on ? 'On' : 'Off'}`;
+      autonomyBadgeEl.className = 'chip ' + (on ? 'ok' : 'muted');
+    }
+  } catch {}
+})();

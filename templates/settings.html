@@ -29,6 +29,14 @@
       <main class="settings">
         <form id="settings-form">
           <div class="group">
+            <h3>Autonomy</h3>
+            <div class="row"><label>Enable autonomy (iterative)</label><input id="enable_autonomy" type="checkbox" /></div>
+            <div class="row"><label>Max iterations</label><input id="max_iterations" type="number" min="1" max="10" /></div>
+            <div class="row"><label>Evaluation threshold (0..1)</label><input id="evaluation_threshold" type="number" min="0" max="1" step="0.05" /></div>
+            <div class="row"><label>Max query refinements</label><input id="max_query_refinements" type="number" min="0" max="3" /></div>
+            <div class="row"><label>Max queries per iteration</label><input id="max_queries_per_iter" type="number" min="1" max="8" /></div>
+          </div>
+          <div class="group">
             <h3>Planning</h3>
             <div class="row"><label>Base URL</label><input id="planning_base_url" /></div>
             <div class="row"><label>API Key</label><input id="planning_api_key" /></div>
@@ -122,7 +130,8 @@
           'planning_temperature','planning_top_p','answer_temperature','answer_top_p','answer_max_tokens',
           'dev_mode','dev_show_prompts','dev_show_requests','dry_run',
           'preview_enable_pan','preview_frames','preview_delay',
-          'preview_yolo_enable','preview_yolo_model','preview_yolo_conf','preview_yolo_rich_panel','preview_yolo_topk'
+          'preview_yolo_enable','preview_yolo_model','preview_yolo_conf','preview_yolo_rich_panel','preview_yolo_topk',
+          'enable_autonomy','max_iterations','evaluation_threshold','max_query_refinements','max_queries_per_iter'
         ];
         ids.forEach(id => {
           const el = document.getElementById(id);
