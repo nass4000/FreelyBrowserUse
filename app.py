@@ -40,6 +40,15 @@ try:
 except Exception:
     YOLO_AVAILABLE = False
 
+# Google Gemini (google-genai)
+GEMINI_AVAILABLE = False
+try:
+    from google import genai as google_genai  # type: ignore
+    from google.genai import types as genai_types  # type: ignore
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
+
 # Selenium / undetected chromedriver
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -119,6 +128,13 @@ def load_config() -> Dict:
         "evaluation_threshold": float(os.getenv("EVALUATION_THRESHOLD", "0.75")),
         "max_query_refinements": int(os.getenv("MAX_QUERY_REFINEMENTS", "1")),
         "max_queries_per_iter": int(os.getenv("MAX_QUERIES_PER_ITER", "4")),
+        # Reasoning mode (Gemini summaries per page)
+        "enable_reasoning_mode": _env_bool("ENABLE_REASONING_MODE", False),
+        # Conversation handling
+        "conversation_max_turns": int(os.getenv("CONVERSATION_MAX_TURNS", "8")),
+        # Google Gemini
+        "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
+        "gemini_reasoning_model": os.getenv("GEMINI_REASONING_MODEL", "gemini-2.0-flash-lite"),
     }
     # Overlay with config file if present
     try:
@@ -1204,7 +1220,7 @@ class ResearchAgent:
         self.answer_params = answer_params or {}
         self.dev_show_prompts = dev_show_prompts
 
-    def make_plan(self, question: str, context: Optional[Dict] = None) -> Tuple[Dict, Optional[Dict], Optional[Dict]]:
+    def make_plan(self, question: str, context: Optional[Dict] = None, conversation: Optional[str] = None) -> Tuple[Dict, Optional[Dict], Optional[Dict]]:
         ctx = context or {}
         prev_queries = ctx.get("previous_queries", [])
         missing = ctx.get("missing_aspects", [])
@@ -1214,13 +1230,15 @@ class ResearchAgent:
             "create a concise plan with: 1) 2-6 specific web search queries (avoid duplicates and previously tried queries), 2) short ordered steps to validate facts across multiple sources, 3) 1-2 sentence rationale.\n"
             "If context lists missing aspects, target them explicitly. Prefer trustworthy, recent sources. Return STRICT JSON with keys: 'queries' (array of strings), 'steps' (array of strings), 'rationale' (string)."
         )
-        user = (
-            f"Question: {question}\n"
-            f"Previously tried queries: {prev_queries}\n"
-            f"Missing aspects to cover: {missing}\n"
-            f"Already visited URLs (avoid unless necessary): {visited}\n"
-            "Return JSON only."
-        )
+        user_parts = []
+        if conversation:
+            user_parts.append(f"Conversation so far:\n{conversation}")
+        user_parts.append(f"Question: {question}")
+        user_parts.append(f"Previously tried queries: {prev_queries}")
+        user_parts.append(f"Missing aspects to cover: {missing}")
+        user_parts.append(f"Already visited URLs (avoid unless necessary): {visited}")
+        user_parts.append("Return JSON only.")
+        user = "\n".join(user_parts)
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user},
@@ -1257,7 +1275,7 @@ class ResearchAgent:
             return content[start : end + 1]
         return "{}"
 
-    def summarize_stream(self, question: str, sources: List[Dict]) -> Generator[dict, None, None]:
+    def summarize_stream(self, question: str, sources: List[Dict], conversation: Optional[str] = None) -> Generator[dict, None, None]:
         # Build a compact context with enumerated sources
         numbered = []
         for i, s in enumerate(sources, 1):
@@ -1272,16 +1290,91 @@ class ResearchAgent:
             "Begin with a single-sentence <p><em>Approach:</em> ...</p> that states your method without exposing hidden chain-of-thought. "
             "Cite using [n] where n is the source number, and include a final <h4>Sources</h4><ul> list linking to each URL with anchors."
         )
-        user_msg = (
-            f"Question: {question}\n\nSources (numbered):\n{context}\n\n"
-            "Write a conversational answer with citations inline like [1], [2] and a short 'Sources' list at the end."
-        )
+        um_parts = []
+        if conversation:
+            um_parts.append(f"Conversation so far:\n{conversation}\n")
+        um_parts.append(f"Question: {question}\n\nSources (numbered):\n{context}\n\n")
+        um_parts.append("Write a conversational answer with citations inline like [1], [2] and a short 'Sources' list at the end.")
+        user_msg = "".join(um_parts)
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_msg},
         ]
         yield {"event": "prompt", "phase": "answer", "model": self.answer_model, "messages": messages}
         yield from self.answer_llm.stream_chat_text(messages, model=self.answer_model, extra_params=self.answer_params)
+
+    def reason_page(self, question: str, page: Dict) -> str:
+        """Summarize one page using Google Gemini (google-genai) if available; otherwise fallback to planning LLM.
+
+        Returns a concise summary of key points relevant to the question.
+        """
+        page_text = (page.get("text") or "")
+        page_text = page_text[:8000]
+        sys_prompt = (
+            "You are an analysis assistant. Given a page's text and the user's question, "
+            "summarize the key points from the page that are relevant to answering the question. "
+            "Be concise, factual, and avoid speculation."
+        )
+        user_prompt = (
+            f"User Question: {question}\n\n"
+            f"Page Title: {page.get('title','')}\n"
+            f"Page Content:\n{page_text}"
+        )
+
+        # Preferred: google-genai direct call
+        try:
+            if GEMINI_AVAILABLE and (CONFIG.get("gemini_api_key") or os.getenv("GEMINI_API_KEY")):
+                client = google_genai.Client(api_key=(CONFIG.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")))
+                model = CONFIG.get("gemini_reasoning_model", "gemini-2.0-flash-lite")
+                contents = [
+                    genai_types.Content(
+                        role="user",
+                        parts=[genai_types.Part.from_text(text=f"{sys_prompt}\n\n{user_prompt}")],
+                    )
+                ]
+                cfg = genai_types.GenerateContentConfig()
+                # Non-stream; aggregate full text
+                try:
+                    resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+                    text = getattr(resp, "text", None)
+                    if text:
+                        return text.strip()
+                    # If no direct text, try parts aggregation
+                    try:
+                        parts = getattr(resp, "candidates", [])[0].content.parts  # type: ignore[attr-defined]
+                        joined = "".join(getattr(p, "text", "") for p in parts)
+                        if joined:
+                            return joined.strip()
+                    except Exception:
+                        pass
+                except Exception:
+                    # Stream as fallback and aggregate
+                    buf = []
+                    for chunk in client.models.generate_content_stream(model=model, contents=contents, config=cfg):
+                        try:
+                            t = getattr(chunk, "text", None)
+                            if t:
+                                buf.append(t)
+                        except Exception:
+                            pass
+                    if buf:
+                        return "".join(buf).strip()
+        except Exception:
+            pass
+
+        # Fallback: use planning LLM via OpenRouter client
+        try:
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            resp = self.planning_llm.chat(messages, model=self.planning_model, stream=False, extra_params={"temperature": 0.2, "top_p": 1})
+            data = resp.json()
+            summary = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return (summary or "").strip() or page_text[:1000]
+        except Exception:
+            # Final fallback: trimmed page text
+            return page_text[:1000]
 
     def evaluate_answer(self, question: str, draft_html: str, sources: List[Dict]) -> Tuple[Dict, Optional[Dict], Optional[Dict]]:
         """Return dict with: { satisfactory: bool, score: float 0..1, missing_aspects: [..], critique: str }.
@@ -1395,6 +1488,28 @@ def post_settings():
     CONFIG.update(data)
     save_config(CONFIG)
     return jsonify({"ok": True, "config": CONFIG})
+
+@app.get("/api/sessions")
+def list_sessions():
+    if not DB_AVAILABLE:
+        return jsonify({"sessions": []})
+    try:
+        db = SessionLocal()
+        sessions = db.query(DBSession).all()
+        session_list = []
+        for s in sessions:
+            title = f"Chat {s.created_at.strftime('%Y-%m-%d %H:%M')}"
+            try:
+                if s.messages:
+                    first_user_msg = next((m.content for m in s.messages if (m.role or '').lower() == 'user'), None)
+                    if first_user_msg:
+                        title = first_user_msg[:50]
+            except Exception:
+                pass
+            session_list.append({"id": s.id, "title": title, "created": s.created_at.isoformat()})
+        return jsonify({"sessions": session_list})
+    except Exception as e:
+        return jsonify({"sessions": [], "error": str(e)})
 
 @app.get("/api/health")
 def api_health():
@@ -1660,6 +1775,24 @@ def api_message():
             },
             dev_show_prompts=conf.get("dev_show_prompts", False),
         )
+        # Prepare compact conversation transcript (exclude current user message)
+        try:
+            max_turns = int(conf.get("conversation_max_turns", 8) or 8)
+        except Exception:
+            max_turns = 8
+        prior_msgs = sess.messages[:-1] if sess.messages else []
+        prior_msgs = prior_msgs[-(max_turns * 2):] if prior_msgs else []
+        convo_lines = []
+        for m in prior_msgs:
+            role = (m.get("role") or "").strip().lower()
+            content = (m.get("content") or "").strip()
+            content = content[:800]
+            if not content:
+                continue
+            prefix = "Assistant" if role == "assistant" else "User"
+            convo_lines.append(f"{prefix}: {content}")
+        conversation_text = "\n".join(convo_lines) if convo_lines else None
+
         # Autonomous iterative loop (Plan -> Act -> Summarize -> Evaluate -> Iterate)
         if conf.get("enable_autonomy", True):
             try:
@@ -1687,7 +1820,7 @@ def api_message():
                         "missing_aspects": (last_eval or {}).get("missing_aspects", []),
                         "visited_urls": visited_urls[-20:],
                     }
-                    plan, plan_usage, plan_debug = agent.make_plan(user_message, context=context)
+                    plan, plan_usage, plan_debug = agent.make_plan(user_message, context=context, conversation=conversation_text)
                     sess.plan = plan
                     yield sse("llm_meta", {"phase": "plan", "iteration": iteration, "model": conf["planning_model"], "base_url": conf["planning_base_url"]})
                     if plan_usage:
@@ -1983,6 +2116,27 @@ def api_message():
                 yield sse("error", {"message": "No relevant pages could be opened."})
                 return
 
+            # Optionally, create reasoning summaries per page using planning LLM
+            pages_to_use = pages_to_read
+            if conf.get("enable_reasoning_mode", False):
+                try:
+                    yield sse("status", {"message": "Generating reasoning summaries for sources..."})
+                    summarized_pages = []
+                    for page in pages_to_read:
+                        try:
+                            yield sse("status", {"message": f"Analyzing source: {page.get('title','')[:60]}..."})
+                        except Exception:
+                            pass
+                        reasoning = agent.reason_page(user_message, page)
+                        summarized_pages.append({
+                            "url": page.get("url"),
+                            "title": page.get("title"),
+                            "text": reasoning,
+                        })
+                    pages_to_use = summarized_pages
+                except Exception:
+                    pages_to_use = pages_to_read
+
             # SUMMARIZE (stream)
             if conf.get("dry_run", False):
                 yield sse("status", {"message": "Dry-run mode: skipping summarization."})
@@ -1990,7 +2144,7 @@ def api_message():
                 return
             yield sse("status", {"message": "Summarizing findings..."})
             yield sse("trace", {"phase": "summarize", "message": "Generating answer from gathered sources"})
-            stream = agent.summarize_stream(user_message, pages_to_read)
+            stream = agent.summarize_stream(user_message, pages_to_use, conversation=conversation_text)
             full_text = []
             for event in stream:
                 if isinstance(event, dict):
