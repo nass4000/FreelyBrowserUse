@@ -6,6 +6,7 @@ import queue
 import threading
 import re
 import base64
+import datetime
 from html import unescape as html_unescape
 from typing import Dict, List, Generator, Optional
 
@@ -13,6 +14,9 @@ from flask import Flask, Response, jsonify, render_template, request
 
 # External deps
 import requests
+
+# Database
+from db_models import init_db, SessionLocal, Session as DBSession, Message, Plan, SearchResult, ScrapedPage, HtmlCache
 
 # Optional: YOLO for preview annotations
 YOLO_AVAILABLE = False
@@ -131,6 +135,14 @@ def save_config(conf: Dict):
 
 CONFIG = load_config()
 
+# Initialize database
+try:
+    init_db()
+    load_html_cache_from_db()
+    DB_AVAILABLE = True
+except Exception as e:
+    print(f"Database initialization failed: {e}. Falling back to in-memory storage.")
+    DB_AVAILABLE = False
 
 # -----------------------------
 # YOLO overlay helper
@@ -405,7 +417,7 @@ def _ensure_local_yolo_weights(name: str) -> Optional[str]:
 
 
 # -----------------------------
-# In-memory session store
+# Session store with DB persistence
 # -----------------------------
 class AgentSession:
     def __init__(self, sid: str):
@@ -415,22 +427,129 @@ class AgentSession:
         self.search_results: List[Dict] = []
         self.scraped_pages: Dict[str, Dict] = {}
         self.created_at = time.time()
+        self._loaded = False
+
+    def save_to_db(self):
+        if not DB_AVAILABLE:
+            return
+        try:
+            db = SessionLocal()
+            # Check if session exists
+            db_session = db.query(DBSession).filter(DBSession.id == self.session_id).first()
+            if not db_session:
+                db_session = DBSession(id=self.session_id, created_at=datetime.datetime.fromtimestamp(self.created_at))
+                db.add(db_session)
+
+            # Save messages
+            db.query(Message).filter(Message.session_id == self.session_id).delete()
+            for msg in self.messages:
+                db_msg = Message(session_id=self.session_id, role=msg.get('role'), content=msg.get('content'))
+                db.add(db_msg)
+
+            # Save plan
+            db.query(Plan).filter(Plan.session_id == self.session_id).delete()
+            if self.plan:
+                db_plan = Plan(session_id=self.session_id, queries=self.plan.get('queries'), steps=self.plan.get('steps'), rationale=self.plan.get('rationale'))
+                db.add(db_plan)
+
+            # Save search results
+            db.query(SearchResult).filter(SearchResult.session_id == self.session_id).delete()
+            for sr in self.search_results:
+                db_sr = SearchResult(session_id=self.session_id, query=sr.get('query'), results=sr.get('results'))
+                db.add(db_sr)
+
+            # Save scraped pages
+            db.query(ScrapedPage).filter(ScrapedPage.session_id == self.session_id).delete()
+            for url, page in self.scraped_pages.items():
+                db_page = ScrapedPage(session_id=self.session_id, url=url, title=page.get('title'), text=page.get('text'))
+                db.add(db_page)
+
+            db.commit()
+        except Exception as e:
+            print(f"Failed to save session {self.session_id} to DB: {e}")
+        finally:
+            db.close()
+
+    def load_from_db(self):
+        if not DB_AVAILABLE or self._loaded:
+            return
+        try:
+            db = SessionLocal()
+            db_session = db.query(DBSession).filter(DBSession.id == self.session_id).first()
+            if db_session:
+                self.created_at = db_session.created_at.timestamp()
+
+                # Load messages
+                self.messages = [{'role': m.role, 'content': m.content} for m in db_session.messages]
+
+                # Load plan
+                if db_session.plans:
+                    plan = db_session.plans[0]
+                    self.plan = {
+                        'queries': plan.queries,
+                        'steps': plan.steps,
+                        'rationale': plan.rationale
+                    }
+
+                # Load search results
+                self.search_results = [{'query': sr.query, 'results': sr.results} for sr in db_session.search_results]
+
+                # Load scraped pages
+                self.scraped_pages = {sp.url: {'url': sp.url, 'title': sp.title, 'text': sp.text} for sp in db_session.scraped_pages}
+
+            self._loaded = True
+        except Exception as e:
+            print(f"Failed to load session {self.session_id} from DB: {e}")
+        finally:
+            db.close()
 
 
 SESSIONS: Dict[str, AgentSession] = {}
 
-# Cached HTML snapshots
+# Cached HTML snapshots with DB persistence
 CACHED_HTML: Dict[str, Dict] = {}
 
 def cache_html_snapshot(html: str, url: str = "", title: str = "") -> str:
     cid = str(uuid.uuid4())
-    CACHED_HTML[cid] = {
+    cache_data = {
         "html": html or "",
         "url": url or "",
         "title": title or "",
         "created_at": time.time(),
     }
+    CACHED_HTML[cid] = cache_data
+
+    # Save to DB
+    if DB_AVAILABLE:
+        try:
+            db = SessionLocal()
+            db_cache = HtmlCache(id=cid, html=html, url=url, title=title)
+            db.add(db_cache)
+            db.commit()
+        except Exception as e:
+            print(f"Failed to save HTML cache {cid} to DB: {e}")
+        finally:
+            db.close()
+
     return cid
+
+def load_html_cache_from_db():
+    if not DB_AVAILABLE:
+        return
+    try:
+        db = SessionLocal()
+        caches = db.query(HtmlCache).all()
+        for cache in caches:
+            CACHED_HTML[cache.id] = {
+                "html": cache.html,
+                "url": cache.url,
+                "title": cache.title,
+                "created_at": cache.created_at.timestamp(),
+            }
+    except Exception as e:
+        print(f"Failed to load HTML cache from DB: {e}")
+    finally:
+        db.close()
 
 def _sanitize_snapshot(html: str) -> str:
     try:
@@ -1389,6 +1508,8 @@ def api_message():
 
     if session_id not in SESSIONS:
         SESSIONS[session_id] = AgentSession(session_id)
+        if DB_AVAILABLE:
+            SESSIONS[session_id].load_from_db()
     sess = SESSIONS[session_id]
     sess.messages.append({"role": "user", "content": user_message})
 
@@ -1445,6 +1566,7 @@ def api_message():
                 yield sse("prompt", plan_debug)
             yield sse("plan", plan)
             yield sse("trace", {"phase": "plan", "message": "Plan created", "steps": plan.get("steps", [])})
+            sess.save_to_db()
 
             # ACT
             # Ensure persistent browser is running (fall back to HTTP if unavailable)
@@ -1495,6 +1617,7 @@ def api_message():
                 if page:
                     sess.scraped_pages[page["url"]] = page
                     yield sse("read_page", {"url": page["url"], "title": page["title"]})
+                    sess.save_to_db()
                     # Fallback: HTML + screenshots
                     try:
                         if not browser:
@@ -1530,6 +1653,7 @@ def api_message():
                     if page and page.get("text"):
                         sess.scraped_pages[page["url"]] = page
                         yield sse("read_page", {"url": page["url"], "title": page["title"]})
+                        sess.save_to_db()
                         # Fallback: HTML + screenshots
                         try:
                             if not browser:
@@ -1589,6 +1713,7 @@ def api_message():
 
             final = "".join(full_text)
             sess.messages.append({"role": "assistant", "content": final})
+            sess.save_to_db()
             yield sse("done", {"ok": True})
         except Exception as e:
             yield sse("error", {"message": f"Unexpected error: {e}"})
